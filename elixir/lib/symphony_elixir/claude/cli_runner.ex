@@ -14,7 +14,12 @@ defmodule SymphonyElixir.Claude.CliRunner do
   require Logger
   alias SymphonyElixir.{Claude.StreamParser, Config, PathSafety, SSH}
 
-  @type session :: %{workspace: Path.t(), worker_host: String.t() | nil, resume: pid()}
+  @type session :: %{
+          workspace: Path.t(),
+          worker_host: String.t() | nil,
+          resume: pid(),
+          mcp_config_path: String.t() | nil
+        }
 
   @port_line_bytes 1_048_576
 
@@ -24,16 +29,32 @@ defmodule SymphonyElixir.Claude.CliRunner do
 
     with {:ok, expanded} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, resume} <- Agent.start_link(fn -> nil end) do
-      {:ok, %{workspace: expanded, worker_host: worker_host, resume: resume}}
+      {:ok,
+       %{
+         workspace: expanded,
+         worker_host: worker_host,
+         resume: resume,
+         mcp_config_path: write_mcp_config()
+       }}
     end
   end
 
   @impl true
-  def run_turn(%{workspace: workspace, worker_host: worker_host, resume: resume}, prompt, _issue, opts \\ []) do
+  def run_turn(
+        %{
+          workspace: workspace,
+          worker_host: worker_host,
+          resume: resume,
+          mcp_config_path: mcp_config_path
+        },
+        prompt,
+        _issue,
+        opts \\ []
+      ) do
     on_message = Keyword.get(opts, :on_message, fn _ -> :ok end)
     resume_id = Agent.get(resume, & &1)
 
-    with {:ok, port} <- start_port(workspace, worker_host, prompt, resume_id) do
+    with {:ok, port} <- start_port(workspace, worker_host, prompt, resume_id, mcp_config_path) do
       try do
         receive_loop(port, on_message, resume, Config.settings!().claude.turn_timeout_ms, "")
       after
@@ -43,8 +64,14 @@ defmodule SymphonyElixir.Claude.CliRunner do
   end
 
   @impl true
-  def stop_session(%{resume: resume}) do
-    if Process.alive?(resume), do: Agent.stop(resume)
+  def stop_session(session) do
+    case Map.get(session, :mcp_config_path) do
+      path when is_binary(path) -> File.rm(path)
+      _ -> :ok
+    end
+
+    resume = Map.get(session, :resume)
+    if is_pid(resume) and Process.alive?(resume), do: Agent.stop(resume)
     :ok
   end
 
@@ -60,7 +87,7 @@ defmodule SymphonyElixir.Claude.CliRunner do
     end
   end
 
-  defp start_port(workspace, nil, prompt, resume_id) do
+  defp start_port(workspace, nil, prompt, resume_id, mcp_config_path) do
     bash = System.find_executable("bash")
 
     if is_nil(bash) do
@@ -73,21 +100,21 @@ defmodule SymphonyElixir.Claude.CliRunner do
          :stderr_to_stdout,
          line: @port_line_bytes,
          cd: String.to_charlist(workspace),
-         args: [~c"-lc", String.to_charlist(command_string(prompt, resume_id))]
+         args: [~c"-lc", String.to_charlist(command_string(prompt, resume_id, mcp_config_path))]
        ])}
     end
   end
 
-  defp start_port(workspace, worker_host, prompt, resume_id) when is_binary(worker_host) do
-    remote = "cd #{shell_escape(workspace)} && exec #{command_string(prompt, resume_id)}"
+  defp start_port(workspace, worker_host, prompt, resume_id, mcp_config_path) when is_binary(worker_host) do
+    remote = "cd #{shell_escape(workspace)} && exec #{command_string(prompt, resume_id, mcp_config_path)}"
     SSH.start_port(worker_host, remote, line: @port_line_bytes)
   end
 
-  defp command_string(prompt, resume_id) do
+  defp command_string(prompt, resume_id, mcp_config_path) do
     claude = Config.settings!().claude
     resume_flag = if is_binary(resume_id), do: " --resume #{shell_escape(resume_id)}", else: ""
+    mcp_flag = if is_binary(mcp_config_path), do: " --mcp-config #{shell_escape(mcp_config_path)}", else: ""
     tools = Enum.join(claude.allowed_tools, ",")
-    mcp_flag = mcp_config_flag(claude.mcp_server_path)
 
     # `< /dev/null` is REQUIRED: claude -p otherwise waits ~3s for stdin before proceeding
     # (the prompt is passed as argv, not stdin). See test/fixtures/claude/SHAPES.md.
@@ -99,31 +126,37 @@ defmodule SymphonyElixir.Claude.CliRunner do
       " " <> shell_escape(prompt) <> " < /dev/null"
   end
 
-  # When mcp_server_path is nil (default), skip --mcp-config entirely so existing
-  # fake-binary unit tests are unaffected. When set, inject Linear auth from Symphony
-  # config (CliRunner runs in the Symphony BEAM which has WORKFLOW.md).
-  defp mcp_config_flag(nil), do: ""
+  # Written ONCE per session in start_session and reused across turns. Returns nil when
+  # no mcp_server_path is configured (default), so existing fake-binary tests are
+  # unaffected. When set, injects Linear auth from Symphony config (CliRunner runs in the
+  # Symphony BEAM which has WORKFLOW.md) into a 0600 temp file (it holds LINEAR_API_KEY).
+  defp write_mcp_config do
+    case Config.settings!().claude.mcp_server_path do
+      path when is_binary(path) and path != "" ->
+        tracker = Config.settings!().tracker
 
-  defp mcp_config_flag(mcp_server_path) when is_binary(mcp_server_path) do
-    tracker = Config.settings!().tracker
-
-    mcp_config = %{
-      "mcpServers" => %{
-        "symphony-linear" => %{
-          "command" => mcp_server_path,
-          "args" => [],
-          "env" => %{
-            "LINEAR_API_KEY" => tracker.api_key || "",
-            "LINEAR_ENDPOINT" => tracker.endpoint
+        config = %{
+          "mcpServers" => %{
+            "symphony-linear" => %{
+              "command" => path,
+              "args" => [],
+              "env" => %{
+                "LINEAR_API_KEY" => tracker.api_key || "",
+                "LINEAR_ENDPOINT" => tracker.endpoint
+              }
+            }
           }
         }
-      }
-    }
 
-    # best-effort temp file; claude reads it at startup, not cleaned up mid-turn
-    path = Path.join(System.tmp_dir!(), "symphony-mcp-#{System.unique_integer([:positive])}.json")
-    File.write!(path, Jason.encode!(mcp_config))
-    " --mcp-config #{shell_escape(path)}"
+        file = Path.join(System.tmp_dir!(), "symphony-mcp-#{System.unique_integer([:positive])}.json")
+        File.write!(file, Jason.encode!(config))
+        # secret: owner-only — the file holds LINEAR_API_KEY.
+        File.chmod!(file, 0o600)
+        file
+
+      _ ->
+        nil
+    end
   end
 
   defp receive_loop(port, on_message, resume, timeout_ms, pending) do

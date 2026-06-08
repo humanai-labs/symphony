@@ -1,7 +1,67 @@
 defmodule SymphonyElixir.Claude.CliRunnerTest do
   use SymphonyElixir.TestSupport
 
+  import Bitwise
+
   alias SymphonyElixir.Claude.CliRunner
+
+  test "start_session writes a 0600 mcp-config with injected Linear auth, stop_session removes it" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-claude-mcp-session-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CL-SESS")
+      mcp_binary = Path.join(test_root, "symphony_linear_mcp")
+      File.mkdir_p!(workspace)
+      File.write!(mcp_binary, "#!/bin/sh\n")
+      File.chmod!(mcp_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        tracker_api_token: "test-api-key",
+        claude_mcp_server_path: mcp_binary
+      )
+
+      assert {:ok, session} = CliRunner.start_session(workspace)
+      path = session.mcp_config_path
+      assert is_binary(path)
+      assert File.exists?(path)
+
+      # secret: owner-only permissions
+      assert (File.stat!(path).mode &&& 0o777) == 0o600
+
+      config = path |> File.read!() |> Jason.decode!()
+      assert get_in(config, ["mcpServers", "symphony-linear", "env", "LINEAR_API_KEY"]) == "test-api-key"
+      assert get_in(config, ["mcpServers", "symphony-linear", "command"]) == mcp_binary
+
+      CliRunner.stop_session(session)
+      refute File.exists?(path)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "start_session leaves mcp_config_path nil when no mcp_server_path is configured" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-claude-no-mcp-session-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CL-NO-SESS")
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:ok, session} = CliRunner.start_session(workspace)
+      assert session.mcp_config_path == nil
+
+      # stop_session must tolerate a nil config path
+      assert CliRunner.stop_session(session) == :ok
+    after
+      File.rm_rf(test_root)
+    end
+  end
 
   test "cli runner runs one turn and emits session_started + turn_completed" do
     test_root = Path.join(System.tmp_dir!(), "symphony-claude-#{System.unique_integer([:positive])}")

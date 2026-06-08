@@ -11,9 +11,15 @@ defmodule SymphonyElixir.Claude.LinearMcpServer do
   def main(_argv) do
     # Escript runtime: bundled apps are NOT auto-started. Req needs its deps up before
     # any HTTP call. (initialize / tools/list need no HTTP; tools/call does.)
-    {:ok, _} = Application.ensure_all_started(:req)
-    deps = %{graphql: &default_graphql/2}
-    loop(deps)
+    case Application.ensure_all_started(:req) do
+      {:ok, _} ->
+        deps = %{graphql: &default_graphql/2}
+        loop(deps)
+
+      {:error, {app, reason}} ->
+        IO.puts(:stderr, "symphony-linear MCP: failed to start #{inspect(app)}: #{inspect(reason)}")
+        System.halt(1)
+    end
   end
 
   defp loop(deps) do
@@ -76,11 +82,11 @@ defmodule SymphonyElixir.Claude.LinearMcpServer do
         },
         deps
       ) do
-    graphql = Map.get(deps, :graphql, &default_graphql/2)
+    # deps.graphql is always set (main/1 wires default_graphql/2; tests inject a stub).
     query = args["query"] || ""
     variables = args["variables"] || %{}
 
-    case graphql.(query, variables) do
+    case deps.graphql.(query, variables) do
       {:ok, response} -> result(id, content(Jason.encode!(response), false))
       {:error, reason} -> result(id, content("Linear error: #{inspect(reason)}", true))
     end
