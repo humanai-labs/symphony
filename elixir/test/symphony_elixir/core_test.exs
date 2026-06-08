@@ -1940,4 +1940,19 @@ defmodule SymphonyElixir.CoreTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "agent runner rejects an unknown runner atom" do
+    issue = %Issue{
+      id: "issue-runner-guard",
+      identifier: "MT-RUN",
+      title: "Runner guard",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-RUN",
+      labels: []
+    }
+
+    assert_raise ArgumentError, fn ->
+      AgentRunner.run(issue, nil, runner: :bogus, max_turns: 1)
+    end
+  end
 end
