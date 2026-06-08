@@ -113,9 +113,18 @@ defmodule SymphonyElixir.TestSupport do
           agent_runner_fallback_enabled: false,
           claude_command: "claude",
           claude_permission_mode: "acceptEdits",
-          claude_allowed_tools: ["Bash", "Edit", "Write", "Read", "Glob", "Grep"],
+          claude_allowed_tools: [
+            "Bash",
+            "Edit",
+            "Write",
+            "Read",
+            "Glob",
+            "Grep",
+            "mcp__symphony-linear__linear_graphql"
+          ],
           claude_turn_timeout_ms: 1_800_000,
           claude_stall_timeout_ms: 600_000,
+          claude_mcp_server_path: nil,
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -180,6 +189,7 @@ defmodule SymphonyElixir.TestSupport do
     claude_allowed_tools = Keyword.get(config, :claude_allowed_tools)
     claude_turn_timeout_ms = Keyword.get(config, :claude_turn_timeout_ms)
     claude_stall_timeout_ms = Keyword.get(config, :claude_stall_timeout_ms)
+    claude_mcp_server_path = Keyword.get(config, :claude_mcp_server_path)
 
     sections =
       [
@@ -220,6 +230,7 @@ defmodule SymphonyElixir.TestSupport do
         "  allowed_tools: #{yaml_value(claude_allowed_tools)}",
         "  turn_timeout_ms: #{yaml_value(claude_turn_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(claude_stall_timeout_ms)}",
+        if(claude_mcp_server_path, do: "  mcp_server_path: #{yaml_value(claude_mcp_server_path)}"),
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

@@ -49,5 +49,8 @@ status.txt
 # Also ignore archive artifacts (built via "mix archive.build").
 *.ez
 
+# Built MCP escript binary.
+/symphony_linear_mcp
+
 # Ignore package tarball (built via "mix hex.build").
 symphony_elixir-*.tar

@@ -228,16 +228,31 @@ defmodule SymphonyElixir.Config.Schema do
       field(:command, :string, default: "claude")
       field(:permission_mode, :string, default: "acceptEdits")
 
-      field(:allowed_tools, {:array, :string}, default: ["Bash", "Edit", "Write", "Read", "Glob", "Grep"])
+      field(:allowed_tools, {:array, :string},
+        default: [
+          "Bash",
+          "Edit",
+          "Write",
+          "Read",
+          "Glob",
+          "Grep",
+          "mcp__symphony-linear__linear_graphql"
+        ]
+      )
 
       field(:turn_timeout_ms, :integer, default: 1_800_000)
       field(:stall_timeout_ms, :integer, default: 600_000)
+      field(:mcp_server_path, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:command, :permission_mode, :allowed_tools, :turn_timeout_ms, :stall_timeout_ms], empty_values: [])
+      |> cast(
+        attrs,
+        [:command, :permission_mode, :allowed_tools, :turn_timeout_ms, :stall_timeout_ms, :mcp_server_path],
+        empty_values: []
+      )
       |> validate_required([:command])
       |> validate_inclusion(:permission_mode, ["default", "acceptEdits", "plan", "bypassPermissions"])
       |> validate_number(:turn_timeout_ms, greater_than: 0)

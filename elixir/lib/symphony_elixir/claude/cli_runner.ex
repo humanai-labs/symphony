@@ -87,6 +87,7 @@ defmodule SymphonyElixir.Claude.CliRunner do
     claude = Config.settings!().claude
     resume_flag = if is_binary(resume_id), do: " --resume #{shell_escape(resume_id)}", else: ""
     tools = Enum.join(claude.allowed_tools, ",")
+    mcp_flag = mcp_config_flag(claude.mcp_server_path)
 
     # `< /dev/null` is REQUIRED: claude -p otherwise waits ~3s for stdin before proceeding
     # (the prompt is passed as argv, not stdin). See test/fixtures/claude/SHAPES.md.
@@ -94,7 +95,35 @@ defmodule SymphonyElixir.Claude.CliRunner do
       " --permission-mode #{shell_escape(claude.permission_mode)}" <>
       " --allowedTools #{shell_escape(tools)}" <>
       resume_flag <>
+      mcp_flag <>
       " " <> shell_escape(prompt) <> " < /dev/null"
+  end
+
+  # When mcp_server_path is nil (default), skip --mcp-config entirely so existing
+  # fake-binary unit tests are unaffected. When set, inject Linear auth from Symphony
+  # config (CliRunner runs in the Symphony BEAM which has WORKFLOW.md).
+  defp mcp_config_flag(nil), do: ""
+
+  defp mcp_config_flag(mcp_server_path) when is_binary(mcp_server_path) do
+    tracker = Config.settings!().tracker
+
+    mcp_config = %{
+      "mcpServers" => %{
+        "symphony-linear" => %{
+          "command" => mcp_server_path,
+          "args" => [],
+          "env" => %{
+            "LINEAR_API_KEY" => tracker.api_key || "",
+            "LINEAR_ENDPOINT" => tracker.endpoint
+          }
+        }
+      }
+    }
+
+    # best-effort temp file; claude reads it at startup, not cleaned up mid-turn
+    path = Path.join(System.tmp_dir!(), "symphony-mcp-#{System.unique_integer([:positive])}.json")
+    File.write!(path, Jason.encode!(mcp_config))
+    " --mcp-config #{shell_escape(path)}"
   end
 
   defp receive_loop(port, on_message, resume, timeout_ms, pending) do

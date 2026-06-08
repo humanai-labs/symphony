@@ -92,6 +92,100 @@ defmodule SymphonyElixir.Claude.CliRunnerTest do
     end
   end
 
+  test "command includes --mcp-config when mcp_server_path is set" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-claude-mcp-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CL-MCP")
+      claude_binary = Path.join(test_root, "fake-claude-mcp")
+      mcp_binary = Path.join(test_root, "symphony_linear_mcp")
+      trace = Path.join(test_root, "argv-mcp.trace")
+      File.mkdir_p!(workspace)
+
+      File.write!(claude_binary, """
+      #!/bin/sh
+      printf 'ARGV:%s\\n' "$*" >> "#{trace}"
+      printf '%s\\n' '{"type":"system","subtype":"init","session_id":"sess-mcp"}'
+      printf '%s\\n' '{"type":"result","subtype":"success","session_id":"sess-mcp","usage":{"input_tokens":1,"output_tokens":1}}'
+      exit 0
+      """)
+
+      File.chmod!(claude_binary, 0o755)
+      # mcp binary just needs to exist (path is injected into config, not executed in test)
+      File.write!(mcp_binary, "#!/bin/sh\n")
+      File.chmod!(mcp_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        claude_command: claude_binary,
+        claude_mcp_server_path: mcp_binary
+      )
+
+      issue = %Issue{
+        id: "issue-cl-mcp",
+        identifier: "MT-CL-MCP",
+        title: "MCP config test",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-CL-MCP",
+        labels: ["agent:claude"]
+      }
+
+      assert {:ok, _result} = CliRunner.run(workspace, "do mcp thing", issue)
+
+      argv_line = File.read!(trace) |> String.split("\n", trim: true) |> List.first()
+      assert argv_line =~ "--mcp-config"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "command does NOT include --mcp-config when mcp_server_path is nil" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-claude-no-mcp-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CL-NO-MCP")
+      claude_binary = Path.join(test_root, "fake-claude-no-mcp")
+      trace = Path.join(test_root, "argv-no-mcp.trace")
+      File.mkdir_p!(workspace)
+
+      File.write!(claude_binary, """
+      #!/bin/sh
+      printf 'ARGV:%s\\n' "$*" >> "#{trace}"
+      printf '%s\\n' '{"type":"system","subtype":"init","session_id":"sess-no-mcp"}'
+      printf '%s\\n' '{"type":"result","subtype":"success","session_id":"sess-no-mcp","usage":{"input_tokens":1,"output_tokens":1}}'
+      exit 0
+      """)
+
+      File.chmod!(claude_binary, 0o755)
+
+      # default: claude_mcp_server_path is nil
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        claude_command: claude_binary
+      )
+
+      issue = %Issue{
+        id: "issue-cl-no-mcp",
+        identifier: "MT-CL-NO-MCP",
+        title: "No MCP config",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-CL-NO-MCP",
+        labels: ["agent:claude"]
+      }
+
+      assert {:ok, _result} = CliRunner.run(workspace, "do thing", issue)
+
+      argv_line = File.read!(trace) |> String.split("\n", trim: true) |> List.first()
+      refute argv_line =~ "--mcp-config"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "second turn resumes the captured session id" do
     test_root = Path.join(System.tmp_dir!(), "symphony-claude-resume-#{System.unique_integer([:positive])}")
 
