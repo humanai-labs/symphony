@@ -255,7 +255,7 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      choose_issues(issues, reconcile_conflicting_ids(state, issues))
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -778,6 +778,24 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  @doc false
+  @spec reconcile_conflicting_ids_for_test(term(), [Issue.t()]) :: term()
+  def reconcile_conflicting_ids_for_test(%State{} = state, issues) when is_list(issues) do
+    reconcile_conflicting_ids(state, issues)
+  end
+
+  defp reconcile_conflicting_ids(%State{} = state, issues) when is_list(issues) do
+    visible =
+      issues
+      |> Enum.flat_map(fn
+        %Issue{id: id} when is_binary(id) -> [id]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    %{state | conflicting: MapSet.filter(state.conflicting, &MapSet.member?(visible, &1))}
+  end
+
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
@@ -974,10 +992,16 @@ defmodule SymphonyElixir.Orchestrator do
     else
       Logger.warning("Skipping dispatch; conflicting agent labels for #{issue_context(issue)}")
 
-      Tracker.create_comment(
-        issue.id,
-        "Conflicting agent labels (agent:codex + agent:claude). Skipped — keep exactly one."
-      )
+      case Tracker.create_comment(
+             issue.id,
+             "Conflicting agent labels (agent:codex + agent:claude). Skipped — keep exactly one."
+           ) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Failed to post conflict comment for #{issue_context(issue)}: #{inspect(reason)}")
+      end
 
       %{state | conflicting: MapSet.put(state.conflicting, issue.id)}
     end
@@ -1229,6 +1253,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
+        conflicting: MapSet.delete(state.conflicting, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }

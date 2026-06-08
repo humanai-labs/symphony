@@ -1797,7 +1797,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     |> elem(1)
   end
 
-  test "conflicting agent labels skip dispatch and post a comment" do
+  test "conflicting labels resolve to a routing error" do
     issue = %Issue{
       id: "issue-conflict",
       identifier: "MT-CONFLICT",
@@ -1873,5 +1873,39 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     refute MapSet.member?(state_after_fix.conflicting, fixed_issue.id)
     refute_received {:memory_tracker_comment, "issue-conflict-once", _}
+  end
+
+  test "conflicting set scrubs ids no longer present in polled candidates" do
+    orchestrator_name = Module.concat(__MODULE__, :ConflictScrubOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    base_state = :sys.get_state(pid)
+
+    state_with_conflicts =
+      Map.put(base_state, :conflicting, MapSet.new(["still-conflicting", "now-closed"]))
+
+    still_present = %Issue{
+      id: "still-conflicting",
+      identifier: "MT-STILL",
+      state: "Todo",
+      url: "https://example.org/issues/MT-STILL",
+      labels: ["agent:codex", "agent:claude"]
+    }
+
+    # "now-closed" left the candidate list (closed/deleted in Linear).
+    scrubbed = Orchestrator.reconcile_conflicting_ids_for_test(state_with_conflicts, [still_present])
+
+    assert MapSet.member?(scrubbed.conflicting, "still-conflicting")
+    refute MapSet.member?(scrubbed.conflicting, "now-closed")
+
+    # An empty candidate list scrubs everything.
+    emptied = Orchestrator.reconcile_conflicting_ids_for_test(state_with_conflicts, [])
+    assert MapSet.size(emptied.conflicting) == 0
   end
 end

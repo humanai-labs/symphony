@@ -1412,4 +1412,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert custom.claude.command == "claude-next"
     assert custom.claude.permission_mode == "plan"
   end
+
+  test "claude rejects an unknown permission_mode" do
+    assert {:error, {:invalid_workflow_config, message}} =
+             SymphonyElixir.Config.Schema.parse(%{"claude" => %{"permission_mode" => "yolo"}})
+
+    assert message =~ "permission_mode"
+  end
 end
