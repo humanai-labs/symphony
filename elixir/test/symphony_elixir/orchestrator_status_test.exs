@@ -1796,4 +1796,21 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
     |> elem(1)
   end
+
+  test "conflicting agent labels skip dispatch and post a comment" do
+    issue = %Issue{
+      id: "issue-conflict",
+      identifier: "MT-CONFLICT",
+      title: "Conflicting labels",
+      state: "Todo",
+      url: "https://example.org/issues/MT-CONFLICT",
+      labels: ["agent:codex", "agent:claude"]
+    }
+
+    assert SymphonyElixir.RunnerSelection.from_labels(issue.labels, :codex) ==
+             {:error, :conflicting_labels}
+
+    assert SymphonyElixir.Orchestrator.runner_for_dispatch_for_test(issue, :codex) ==
+             {:error, :conflicting_labels}
+  end
 end

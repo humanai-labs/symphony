@@ -399,6 +399,17 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
+  @doc false
+  @spec runner_for_dispatch_for_test(Issue.t(), :codex | :claude) ::
+          {:ok, :codex | :claude} | {:error, :conflicting_labels}
+  def runner_for_dispatch_for_test(%Issue{} = issue, default), do: resolve_runner(issue, default)
+
+  defp resolve_runner(%Issue{labels: labels}, default) when is_list(labels) do
+    SymphonyElixir.RunnerSelection.from_labels(labels, default)
+  end
+
+  defp resolve_runner(_issue, default), do: {:ok, default}
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -928,20 +939,35 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
+    default_runner = String.to_existing_atom(Config.settings!().agent.default_runner)
 
-    case select_worker_host(state, preferred_worker_host) do
-      :no_worker_capacity ->
-        Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
-        state
+    case resolve_runner(issue, default_runner) do
+      {:error, :conflicting_labels} ->
+        Logger.warning("Skipping dispatch; conflicting agent labels for #{issue_context(issue)}")
 
-      worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        Tracker.create_comment(
+          issue.id,
+          "Conflicting agent labels (agent:codex + agent:claude). Skipped — keep exactly one."
+        )
+
+        release_issue_claim(state, issue.id)
+
+      {:ok, runner} ->
+        case select_worker_host(state, preferred_worker_host) do
+          :no_worker_capacity ->
+            Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+
+            state
+
+          worker_host ->
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, runner)
+        end
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, runner) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host, runner: runner)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -969,6 +995,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            runner: runner,
             started_at: DateTime.utc_now()
           })
 
@@ -1391,6 +1418,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          runner: Map.get(metadata, :runner, :codex),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
