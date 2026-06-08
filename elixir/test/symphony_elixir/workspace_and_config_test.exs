@@ -1419,4 +1419,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert message =~ "permission_mode"
   end
+
+  test "stall timeout resolves per runner" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms: 111,
+      claude_stall_timeout_ms: 222
+    )
+
+    assert SymphonyElixir.Config.stall_timeout_ms_for_runner(:codex) == 111
+    assert SymphonyElixir.Config.stall_timeout_ms_for_runner(:claude) == 222
+  end
 end

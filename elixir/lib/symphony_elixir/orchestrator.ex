@@ -648,22 +648,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
-    timeout_ms = Config.settings!().codex.stall_timeout_ms
+    if map_size(state.running) == 0 do
+      state
+    else
+      now = DateTime.utc_now()
 
-    cond do
-      timeout_ms <= 0 ->
-        state
-
-      map_size(state.running) == 0 ->
-        state
-
-      true ->
-        now = DateTime.utc_now()
-
-        Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-          maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
-        end)
+      Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+        # Per-runner stall timeout: pick by the running entry's runner.
+        timeout_ms = Config.stall_timeout_ms_for_runner(Map.get(running_entry, :runner, :codex))
+        maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
+      end)
     end
+  end
+
+  defp maybe_restart_stalled_issue(state, _issue_id, _running_entry, _now, timeout_ms)
+       when timeout_ms <= 0 do
+    state
   end
 
   defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
