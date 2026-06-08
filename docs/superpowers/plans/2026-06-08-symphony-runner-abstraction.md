@@ -1231,6 +1231,9 @@ defmodule SymphonyElixir.Claude.LinearMcpServer do
 
   @spec main([String.t()]) :: no_return()
   def main(_argv) do
+    # Escript runtime: bundled apps are NOT auto-started. Req needs its deps up before
+    # any HTTP call. (initialize / tools/list need no HTTP; tools/call does.)
+    {:ok, _} = Application.ensure_all_started(:req)
     deps = %{graphql: &default_graphql/2}
     loop(deps)
   end
@@ -1299,11 +1302,32 @@ defmodule SymphonyElixir.Claude.LinearMcpServer do
   defp result(id, result), do: %{"jsonrpc" => "2.0", "id" => id, "result" => result}
   defp content(text, is_error?), do: %{"content" => [%{"type" => "text", "text" => text}], "isError" => is_error?}
 
+  # IMPORTANT: this runs as a standalone escript spawned by `claude` inside the issue
+  # workspace — there is NO Symphony WORKFLOW.md there, so we must NOT use
+  # Config.settings!()/Linear.Client (which read tracker.api_key/endpoint from config).
+  # Auth comes from env injected by CliRunner via the --mcp-config `env` block.
   defp default_graphql(query, variables) do
-    SymphonyElixir.Linear.Client.graphql(query, variables, [])
+    api_key = System.get_env("LINEAR_API_KEY")
+    endpoint = System.get_env("LINEAR_ENDPOINT") || "https://api.linear.app/graphql"
+
+    if is_nil(api_key) or api_key == "" do
+      {:error, :missing_linear_api_token}
+    else
+      case Req.post(endpoint,
+             headers: [{"Authorization", api_key}, {"Content-Type", "application/json"}],
+             json: %{"query" => query, "variables" => variables},
+             connect_options: [timeout: 30_000]
+           ) do
+        {:ok, %{status: 200, body: body}} -> {:ok, body}
+        {:ok, %{status: status}} -> {:error, {:linear_api_status, status}}
+        {:error, reason} -> {:error, {:linear_api_request, reason}}
+      end
+    end
   end
 end
 ```
+
+> Why not reuse `Linear.Client.graphql/3`? Its `graphql_headers/0` and `post_graphql_request/2` read `Config.settings!().tracker.{api_key,endpoint}` (i.e. WORKFLOW.md). The escript runs in the issue workspace where that config does not exist. The direct env-based `Req.post` is the decoupled path. The HTTP call is only exercised on a real `tools/call` (validated in Phase 5 e2e); Phase 4's escript smoke only needs `initialize`.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -1346,9 +1370,33 @@ cd elixir && printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","param
 ```
 Expected: a single JSON line whose `result.serverInfo.name` is `symphony-linear`. (No Linear creds needed for `initialize`.)
 
-- [ ] **Step 4: Write a failing test that CliRunner emits `--mcp-config`**
+- [ ] **Step 4: Add `claude.mcp_server_path` config + wire `--mcp-config` with env auth**
 
-Extend the resume/argv-trace test (or add one) asserting the argv contains `--mcp-config`. Implement `command_string/2` to write a temp mcp-config JSON (pointing `command` at the built escript path, `env.LINEAR_API_KEY` from `Config`) and append `--mcp-config <path>`. Gate it: only add the flag when the escript path exists, so unit tests with a fake claude binary still pass. Decide the escript path via `Application.app_dir` or a configurable `claude.mcp_server_path` (add as an optional field defaulting to `nil`; when nil, skip `--mcp-config`). The test sets it to a dummy file and asserts the flag appears.
+Add an optional `mcp_server_path` (`:string`, default `nil`) to the `Claude` embedded schema (cast it; no validation). When `nil`, `command_string/2` skips `--mcp-config` entirely (so the fake-binary unit tests stay unaffected). When set, `command_string/2` builds the mcpServers config, writes it to a temp file, injecting auth **from Symphony's config** (CliRunner runs in the Symphony BEAM, which HAS WORKFLOW.md), and appends the flag:
+
+```elixir
+tracker = Config.settings!().tracker
+mcp_config = %{
+  "mcpServers" => %{
+    "symphony-linear" => %{
+      "command" => claude.mcp_server_path,
+      "args" => [],
+      "env" => %{"LINEAR_API_KEY" => tracker.api_key, "LINEAR_ENDPOINT" => tracker.endpoint}
+    }
+  }
+}
+# best-effort temp file; claude reads it at startup, not cleaned up mid-turn
+path = Path.join(System.tmp_dir!(), "symphony-mcp-#{System.unique_integer([:positive])}.json")
+File.write!(path, Jason.encode!(mcp_config))
+# ... append " --mcp-config #{shell_escape(path)}" to the command (before `< /dev/null`)
+```
+
+`tracker.api_key`/`endpoint` are already resolved from `LINEAR_API_KEY` env / WORKFLOW.md by the config layer; the escript reads them back from its injected env (Task 4.1 `default_graphql/2`).
+
+Then:
+- Add `mcp_server_path` to the `Claude` schema cast list, and a `claude_mcp_server_path` default (`nil`) + binding + yaml line in `test_support.exs`.
+- Add `"mcp__symphony-linear__linear_graphql"` to the default `claude.allowed_tools` (BOTH the schema default list and the `test_support.exs` default) so the tool is actually permitted at runtime.
+- Write a failing argv-trace test (model: the resume test) that sets `claude_mcp_server_path` to a dummy file via `write_workflow_file!` and asserts the emitted argv contains `--mcp-config`; also assert that with `mcp_server_path: nil` (default) the argv does NOT contain `--mcp-config`.
 
 - [ ] **Step 5: Run, format, commit**
 
