@@ -369,6 +369,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
+                 "runner" => "claude",
                  "worker_host" => nil,
                  "workspace_path" => nil
                }
@@ -754,7 +755,8 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_url: "https://example.org/issues/MT-RETRY",
           attempt: 2,
           due_in_ms: 2_000,
-          error: "boom"
+          error: "boom",
+          runner: :claude
         }
       ],
       blocked: [
