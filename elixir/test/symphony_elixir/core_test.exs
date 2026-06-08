@@ -917,6 +917,27 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "attempt=3"
   end
 
+  test "prompt builder preserves UTF-8 workflow prompt content" do
+    workflow_prompt = "变更必须保持小范围，处理 {{ issue.identifier }}。"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "FAK-28",
+      title: "Handle UTF-8 workflow prompt",
+      description: "Keep prompt JSON encodable",
+      state: "Todo",
+      url: "https://example.org/issues/FAK-28",
+      labels: []
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt == "变更必须保持小范围，处理 FAK-28。"
+    assert String.valid?(prompt)
+    assert {:ok, _encoded} = Jason.encode(%{"text" => prompt})
+  end
+
   test "prompt builder renders issue datetime fields without crashing" do
     workflow_prompt = "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
 

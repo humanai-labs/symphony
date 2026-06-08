@@ -141,6 +141,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:default_runner, :string, default: "codex")
       field(:runner_failure_budget, :integer, default: 3)
       field(:runner_fallback_enabled, :boolean, default: false)
+      field(:reserved_concurrent_agents_by_state, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -155,7 +156,8 @@ defmodule SymphonyElixir.Config.Schema do
           :max_concurrent_agents_by_state,
           :default_runner,
           :runner_failure_budget,
-          :runner_fallback_enabled
+          :runner_fallback_enabled,
+          :reserved_concurrent_agents_by_state
         ],
         empty_values: []
       )
@@ -163,9 +165,12 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
+      |> update_change(:reserved_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
       |> validate_inclusion(:default_runner, ["codex", "claude"])
       |> validate_number(:runner_failure_budget, greater_than: 0)
+      |> Schema.validate_state_limits(:reserved_concurrent_agents_by_state)
+      |> Schema.validate_reserved_agent_limits()
     end
   end
 
@@ -411,6 +416,29 @@ defmodule SymphonyElixir.Config.Schema do
         end
       end)
     end)
+  end
+
+  @doc false
+  @spec validate_reserved_agent_limits(Ecto.Changeset.t()) :: Ecto.Changeset.t()
+  def validate_reserved_agent_limits(changeset) do
+    max_concurrent_agents = get_field(changeset, :max_concurrent_agents)
+    reserved_limits = get_field(changeset, :reserved_concurrent_agents_by_state) || %{}
+
+    reserved_total =
+      reserved_limits
+      |> Map.values()
+      |> Enum.filter(&is_integer/1)
+      |> Enum.sum()
+
+    if is_integer(max_concurrent_agents) and reserved_total > max_concurrent_agents do
+      add_error(
+        changeset,
+        :reserved_concurrent_agents_by_state,
+        "reserved limits must not exceed max_concurrent_agents"
+      )
+    else
+      changeset
+    end
   end
 
   defp changeset(attrs) do
