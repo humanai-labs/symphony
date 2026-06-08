@@ -1983,8 +1983,18 @@ defmodule SymphonyElixir.Orchestrator do
 
     Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
       Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
+      Enum.find_value(payloads, &flat_token_usage_from_payload/1) ||
       %{}
   end
+
+  # Claude (and any runner) emitting a flat top-level token map:
+  # %{input_tokens:, output_tokens:, total_tokens:}. Fires only when the two Codex
+  # extractors above miss, so it cannot regress Codex token accounting.
+  defp flat_token_usage_from_payload(payload) when is_map(payload) do
+    if integer_token_map?(payload), do: payload, else: nil
+  end
+
+  defp flat_token_usage_from_payload(_payload), do: nil
 
   defp extract_rate_limits(update) do
     rate_limits_from_payload(update[:rate_limits]) ||

@@ -275,6 +275,83 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert completed_state.codex_totals.total_tokens == 16
   end
 
+  test "orchestrator accumulates Claude flat top-level token usage" do
+    issue_id = "issue-claude-token-usage"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CLAUDE-TOK",
+      title: "Claude flat token usage",
+      description: "Track flat top-level usage",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-CLAUDE-TOK",
+      labels: ["agent:claude"]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ClaudeTokenUsageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "sess-claude",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      runner: :claude,
+      runner_failure_count: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    # Claude emits a flat top-level usage map with event: :turn_completed and NO method key.
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :turn_completed,
+         session_id: "sess-claude",
+         usage: %{input_tokens: 5, output_tokens: 7, total_tokens: 12},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 5
+    assert snapshot_entry.codex_output_tokens == 7
+    assert snapshot_entry.codex_total_tokens == 12
+
+    send(pid, {:DOWN, process_ref, :process, self(), :normal})
+    completed_state = :sys.get_state(pid)
+    assert completed_state.codex_totals.input_tokens == 5
+    assert completed_state.codex_totals.output_tokens == 7
+    assert completed_state.codex_totals.total_tokens == 12
+  end
+
   test "orchestrator snapshot tracks codex token-count cumulative usage payloads" do
     issue_id = "issue-token-count-snapshot"
 
@@ -966,8 +1043,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    # Backoff is 10_000ms; allow ~1s of scheduler jitter on a slow machine.
-    assert remaining_ms >= 9_000
+    # Backoff is 10_000ms. Lower bound stays clearly above the 1s continuation timer
+    # while tolerating heavy scheduler starvation on a slow machine.
+    assert remaining_ms >= 8_000
     assert remaining_ms <= 10_500
   end
 

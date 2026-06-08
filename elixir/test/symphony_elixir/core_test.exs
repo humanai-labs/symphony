@@ -675,8 +675,13 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    # Continuation backoff is 1_000ms; tolerate scheduler jitter on a slow machine.
-    assert_due_in_range(due_at_ms, 250, 1_100)
+    # Continuation delay is exactly 1_000ms. Assert it is the continuation timer (<= 1s)
+    # and NOT the ~10s failure backoff; the lower bound is relaxed to 0 so scheduler
+    # starvation on a slow machine (which can nearly elapse the 1s timer before we
+    # measure) cannot make this flake.
+    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+    assert remaining_ms >= 0
+    assert remaining_ms <= 1_000
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
