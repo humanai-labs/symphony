@@ -609,7 +609,9 @@ Add a private resolver + test wrapper near the other `_for_test` helpers (after 
   defp resolve_runner(_issue, default), do: {:ok, default}
 ```
 
-In `do_dispatch_issue/4` (line 957), resolve the runner before selecting a worker host and short-circuit conflicts:
+In `do_dispatch_issue/4` (line 957), resolve the runner before selecting a worker host. On conflict, comment **exactly once** and remember the issue in a `conflicting` set so it is not re-commented on every poll; clear it when the conflict resolves (so a future conflict re-comments). **Do NOT use `release_issue_claim` here** — the issue was never claimed, so that call is a no-op and the issue would be re-selected and re-commented every poll cycle (comment spam).
+
+Add a `conflicting: MapSet.new()` field to the `State` defstruct (alongside `claimed`, `blocked`, `retry_attempts`).
 
 ```elixir
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
@@ -618,11 +620,12 @@ In `do_dispatch_issue/4` (line 957), resolve the runner before selecting a worke
 
     case resolve_runner(issue, default_runner) do
       {:error, :conflicting_labels} ->
-        Logger.warning("Skipping dispatch; conflicting agent labels for #{issue_context(issue)}")
-        Tracker.create_comment(issue.id, "Conflicting agent labels (agent:codex + agent:claude). Skipped — keep exactly one.")
-        release_issue_claim(state, issue.id)
+        handle_conflicting_labels(state, issue)
 
       {:ok, runner} ->
+        # Conflict (if any) resolved — stop tracking so a future conflict re-comments.
+        state = %{state | conflicting: MapSet.delete(state.conflicting, issue.id)}
+
         case select_worker_host(state, preferred_worker_host) do
           :no_worker_capacity ->
             Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
@@ -633,7 +636,19 @@ In `do_dispatch_issue/4` (line 957), resolve the runner before selecting a worke
         end
     end
   end
+
+  defp handle_conflicting_labels(%State{} = state, %Issue{} = issue) do
+    if MapSet.member?(state.conflicting, issue.id) do
+      state
+    else
+      Logger.warning("Skipping dispatch; conflicting agent labels for #{issue_context(issue)}")
+      Tracker.create_comment(issue.id, "Conflicting agent labels (agent:codex + agent:claude). Skipped — keep exactly one.")
+      %{state | conflicting: MapSet.put(state.conflicting, issue.id)}
+    end
+  end
 ```
+
+The Step 1 test must also assert the dedupe: a second `do_dispatch_issue` on the same still-conflicting issue posts **no** additional comment, and once one label is removed the issue dispatches normally and is cleared from `conflicting`.
 
 Change `spawn_issue_on_worker_host/5` to `/6` (add `runner`), pass `runner: runner` into `AgentRunner.run`, and store `runner: runner` in the running-entry map:
 
@@ -689,35 +704,16 @@ git commit -m "[orchestrator] Route dispatch by label, store runner, skip confli
 
 **Outcome:** `Claude.CliRunner` runs a Claude turn over a port driving `claude -p --output-format stream-json`, emits the shared event vocabulary as flat top-level maps, threads `--resume` across turns, and is covered by fake-binary tests modeled on `app_server_test.exs`.
 
-### Task 3.0 (SPIKE): Capture real `claude` stream-json shapes
+### Task 3.0 (SPIKE): Capture real `claude` stream-json shapes — ✅ DONE (controller)
 
-**Files:**
-- Create: `elixir/test/fixtures/claude/` (fixture files)
+Already done by the controller against `claude` 2.1.168. Artifacts committed:
+- `elixir/test/fixtures/claude/turn_success.jsonl` — one real successful turn (15 NDJSON lines).
+- `elixir/test/fixtures/claude/SHAPES.md` — documented line sequence + field map.
 
-- [ ] **Step 1: Record a real one-turn run**
-
-Run (in any throwaway git repo dir):
-
-```bash
-mkdir -p elixir/test/fixtures/claude
-cd /tmp && rm -rf claude-spike && mkdir claude-spike && cd claude-spike && git init -q
-claude -p --output-format stream-json --verbose --permission-mode acceptEdits \
-  "Create a file hello.txt containing the word hi, then stop." \
-  > /Users/zfc/code/xhs33-symphony-automation/symphony/elixir/test/fixtures/claude/turn_success.jsonl 2>&1 || true
-```
-
-- [ ] **Step 2: Inspect and record the exact shapes**
-
-Run: `head -5 elixir/test/fixtures/claude/turn_success.jsonl && tail -2 elixir/test/fixtures/claude/turn_success.jsonl`
-
-Record, in a comment block at the top of `elixir/test/fixtures/claude/SHAPES.md`, the exact JSON keys for: the init/system line (where `session_id` lives), an assistant message line, the final `result` line (its `subtype`, `usage`, `session_id`, `total_cost_usd`). Capture an error/`error_max_turns` variant too if reproducible. **These recorded shapes are the source of truth for Tasks 3.1–3.3.** If a field name below differs from what you recorded, the recorded name wins — update the parser code accordingly.
-
-- [ ] **Step 3: Commit the fixtures**
-
-```bash
-git add elixir/test/fixtures/claude/
-git commit -m "[claude] Record real stream-json fixtures (spike)"
-```
+**Key findings the parser/runner code below already reflect (do NOT re-run claude):**
+- Session start is `type=system, subtype=init` (carries `session_id`); other system subtypes (`hook_started`, `hook_response`, `thinking_tokens`) and `rate_limit_event` → `:notification`.
+- The terminal line is `type=result`; **pass/fail is driven by the `is_error` boolean**, not the subtype string. `usage` has `input_tokens`/`output_tokens`.
+- `claude -p` needs `< /dev/null` on the command (it waits ~3s for stdin otherwise).
 
 ### Task 3.1: `Claude.StreamParser` — map one decoded line to an event
 
@@ -751,9 +747,14 @@ defmodule SymphonyElixir.Claude.StreamParserTest do
              StreamParser.classify(line)
   end
 
-  test "error result yields turn_failed" do
-    line = %{"type" => "result", "subtype" => "error_max_turns", "session_id" => "sess-1"}
+  test "result with is_error: true yields turn_failed (the real failure signal)" do
+    line = %{"type" => "result", "subtype" => "error_max_turns", "is_error" => true, "session_id" => "sess-1"}
     assert {:turn_failed, %{session_id: "sess-1"}} = StreamParser.classify(line)
+  end
+
+  test "result with is_error: false yields turn_completed regardless of subtype" do
+    line = %{"type" => "result", "subtype" => "success", "is_error" => false, "session_id" => "sess-1"}
+    assert {:turn_completed, %{session_id: "sess-1"}} = StreamParser.classify(line)
   end
 
   test "assistant message is a notification" do
@@ -786,10 +787,8 @@ defmodule SymphonyElixir.Claude.StreamParser do
   def classify(%{"type" => "system", "subtype" => "init"} = line),
     do: {:session_started, %{session_id: line["session_id"]}}
 
-  def classify(%{"type" => "result", "subtype" => "success"} = line),
-    do: {:turn_completed, %{session_id: line["session_id"], usage: usage(line["usage"])}}
-
-  def classify(%{"type" => "result", "subtype" => "error" <> _} = line),
+  # Pass/fail is driven by is_error (see test/fixtures/claude/SHAPES.md), not subtype strings.
+  def classify(%{"type" => "result", "is_error" => true} = line),
     do: {:turn_failed, %{session_id: line["session_id"], usage: usage(line["usage"])}}
 
   def classify(%{"type" => "result"} = line),
@@ -975,10 +974,12 @@ defmodule SymphonyElixir.Claude.CliRunner do
     resume_flag = if is_binary(resume_id), do: " --resume #{shell_escape(resume_id)}", else: ""
     tools = Enum.join(claude.allowed_tools, ",")
 
+    # `< /dev/null` is REQUIRED: claude -p otherwise waits ~3s for stdin before proceeding
+    # (the prompt is passed as argv, not stdin). See test/fixtures/claude/SHAPES.md.
     "#{claude.command} -p --output-format stream-json --verbose" <>
       " --permission-mode #{shell_escape(claude.permission_mode)}" <>
       " --allowedTools #{shell_escape(tools)}" <> resume_flag <>
-      " " <> shell_escape(prompt)
+      " " <> shell_escape(prompt) <> " < /dev/null"
   end
 
   defp receive_loop(port, on_message, resume, timeout_ms, pending) do
@@ -1144,18 +1145,19 @@ git commit -m "[claude] Test resume session threading across turns"
 
 **Outcome:** Claude can write Workpad/comments/state to Linear through a stdio MCP escript that reuses `Linear.Client`. `CliRunner` generates an `--mcp-config` pointing at it.
 
-### Task 4.0 (SPIKE): Confirm the MCP handshake `claude` expects
+### Task 4.0 (SPIKE): Confirm the MCP handshake `claude` expects — ✅ DONE (controller)
 
-- [ ] **Step 1: Read the installed Claude Code MCP docs/help**
+Confirmed against `claude` 2.1.168 (`claude --help`, `claude mcp --help`, `claude mcp add-json --help`):
 
-Run: `claude --help | grep -A3 mcp` and check `claude mcp --help`. Record in `elixir/test/fixtures/claude/MCP.md`: the exact `--mcp-config` JSON shape (stdio server entry: `{"command":..., "args":[...], "env":{...}}`), and the MCP JSON-RPC methods a stdio server must answer (`initialize`, `tools/list`, `tools/call`) with their exact response envelopes. **These recorded shapes are the source of truth for Tasks 4.1–4.2.**
+- `claude -p` accepts `--mcp-config <configs...>` — loads MCP servers from JSON file(s) or inline JSON.
+- **stdio server config shape** (write this to a temp file and pass as `--mcp-config`):
+  ```json
+  {"mcpServers": {"symphony-linear": {"command": "<escript path>", "args": [], "env": {"LINEAR_API_KEY": "<key>"}}}}
+  ```
+- **allowedTools entry** for an MCP tool is `mcp__<server>__<tool>`, i.e. `mcp__symphony-linear__linear_graphql` (or `mcp__symphony-linear` to allow all tools from that server). Add this to `claude.allowed_tools` when the MCP server is wired.
+- Standard MCP JSON-RPC over stdio: client sends `initialize` → server replies `{protocolVersion, capabilities, serverInfo}`; client sends `notifications/initialized` (no reply); then `tools/list` and `tools/call`. `tools/call` result envelope is `{"content": [{"type":"text","text": ...}], "isError": bool}`. Task 4.1's `handle_request/2` already matches this.
 
-- [ ] **Step 2: Commit the notes**
-
-```bash
-git add elixir/test/fixtures/claude/MCP.md
-git commit -m "[claude] Record MCP handshake notes (spike)"
-```
+No `MCP.md` file needed — findings folded into Task 4.1/4.2 below.
 
 ### Task 4.1: `Claude.LinearMcpServer` — stdio MCP over Linear.Client
 
