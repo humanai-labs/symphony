@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      conflicting: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
@@ -937,22 +938,24 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc false
+  @spec do_dispatch_issue_for_test(term(), Issue.t(), term(), String.t() | nil) :: term()
+  def do_dispatch_issue_for_test(%State{} = state, %Issue{} = issue, attempt, preferred_worker_host) do
+    do_dispatch_issue(state, issue, attempt, preferred_worker_host)
+  end
+
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
     default_runner = String.to_existing_atom(Config.settings!().agent.default_runner)
 
     case resolve_runner(issue, default_runner) do
       {:error, :conflicting_labels} ->
-        Logger.warning("Skipping dispatch; conflicting agent labels for #{issue_context(issue)}")
-
-        Tracker.create_comment(
-          issue.id,
-          "Conflicting agent labels (agent:codex + agent:claude). Skipped — keep exactly one."
-        )
-
-        release_issue_claim(state, issue.id)
+        handle_conflicting_labels(state, issue)
 
       {:ok, runner} ->
+        # Conflict (if any) resolved — stop tracking so a future conflict re-comments.
+        state = %{state | conflicting: MapSet.delete(state.conflicting, issue.id)}
+
         case select_worker_host(state, preferred_worker_host) do
           :no_worker_capacity ->
             Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
@@ -962,6 +965,21 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host ->
             spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, runner)
         end
+    end
+  end
+
+  defp handle_conflicting_labels(%State{} = state, %Issue{} = issue) do
+    if MapSet.member?(state.conflicting, issue.id) do
+      state
+    else
+      Logger.warning("Skipping dispatch; conflicting agent labels for #{issue_context(issue)}")
+
+      Tracker.create_comment(
+        issue.id,
+        "Conflicting agent labels (agent:codex + agent:claude). Skipped — keep exactly one."
+      )
+
+      %{state | conflicting: MapSet.put(state.conflicting, issue.id)}
     end
   end
 

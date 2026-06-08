@@ -1813,4 +1813,65 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert SymphonyElixir.Orchestrator.runner_for_dispatch_for_test(issue, :codex) ==
              {:error, :conflicting_labels}
   end
+
+  test "conflicting agent labels comment exactly once and auto-resume when fixed" do
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      worker_ssh_hosts: ["worker-01"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    conflicting_issue = %Issue{
+      id: "issue-conflict-once",
+      identifier: "MT-CONFLICT-ONCE",
+      title: "Conflicting labels",
+      state: "Todo",
+      url: "https://example.org/issues/MT-CONFLICT-ONCE",
+      labels: ["agent:codex", "agent:claude"]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ConflictOnceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    base_state = :sys.get_state(pid)
+
+    # First encounter: posts exactly one comment and records the conflict.
+    state_after_first =
+      Orchestrator.do_dispatch_issue_for_test(base_state, conflicting_issue, nil, nil)
+
+    assert MapSet.member?(state_after_first.conflicting, conflicting_issue.id)
+
+    assert_receive {:memory_tracker_comment, "issue-conflict-once", "Conflicting agent labels (agent:codex + agent:claude)." <> _}
+
+    # Second encounter on the still-conflicting issue: no additional comment.
+    state_after_second =
+      Orchestrator.do_dispatch_issue_for_test(state_after_first, conflicting_issue, nil, nil)
+
+    assert MapSet.member?(state_after_second.conflicting, conflicting_issue.id)
+    refute_received {:memory_tracker_comment, "issue-conflict-once", _}
+
+    # Labels fixed: routes normally and the id is removed from conflicting.
+    fixed_issue = %{conflicting_issue | labels: ["agent:codex"]}
+
+    # Saturate the single worker slot so dispatch resolves without spawning.
+    saturated_state =
+      Map.put(state_after_second, :running, %{
+        "other-running" => %{worker_host: "worker-01"}
+      })
+
+    state_after_fix =
+      Orchestrator.do_dispatch_issue_for_test(saturated_state, fixed_issue, nil, nil)
+
+    refute MapSet.member?(state_after_fix.conflicting, fixed_issue.id)
+    refute_received {:memory_tracker_comment, "issue-conflict-once", _}
+  end
 end
