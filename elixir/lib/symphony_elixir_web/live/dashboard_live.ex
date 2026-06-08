@@ -159,6 +159,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                        <.runner_badge runner={Map.get(entry, :runner, :codex)} />
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
                       </div>
                     </td>
@@ -240,6 +241,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                        <.runner_badge runner={Map.get(entry, :runner, :codex)} />
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
                       </div>
                     </td>
@@ -361,6 +363,22 @@ defmodule SymphonyElixirWeb.DashboardLive do
     <% end %>
     """
   end
+
+  attr(:runner, :any, default: :codex)
+
+  defp runner_badge(assigns) do
+    assigns = assign(assigns, :runner_label, runner_label(assigns.runner))
+
+    ~H"""
+    <span class={"runner-badge runner-badge-#{@runner_label}"} title={"Runner: #{@runner_label}"}>
+      <%= @runner_label %>
+    </span>
+    """
+  end
+
+  defp runner_label(runner) when is_atom(runner) and not is_nil(runner), do: Atom.to_string(runner)
+  defp runner_label(runner) when is_binary(runner), do: runner
+  defp runner_label(_runner), do: "codex"
 
   defp external_issue_url(url) when is_binary(url) do
     url = String.trim(url)
