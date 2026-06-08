@@ -30,6 +30,11 @@ defmodule SymphonyElixir.Claude.StreamParserTest do
     assert {:turn_completed, %{session_id: "sess-1"}} = StreamParser.classify(line)
   end
 
+  test "is_error: true overrides a success subtype -> turn_failed" do
+    line = %{"type" => "result", "subtype" => "success", "is_error" => true, "session_id" => "s"}
+    assert {:turn_failed, _} = StreamParser.classify(line)
+  end
+
   test "assistant message is a notification" do
     assert {:notification, %{}} = StreamParser.classify(%{"type" => "assistant", "message" => %{}})
   end

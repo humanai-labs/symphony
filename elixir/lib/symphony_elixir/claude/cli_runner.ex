@@ -3,12 +3,18 @@ defmodule SymphonyElixir.Claude.CliRunner do
   Runs a Linear issue turn with Claude Code over `claude -p --output-format stream-json`.
   Unlike Codex app-server (long-lived thread), each turn is a one-shot process resumed
   via `--resume <session_id>`; the resume id lives in a small Agent inside the session.
+
+  Stall detection (a turn going quiet for too long) is handled by the Orchestrator via
+  the per-runner `claude.stall_timeout_ms` (Phase 7), NOT inside this runner — the
+  runner's `turn_timeout_ms` is a per-message receive timeout, same as `Codex.AppServer`.
   """
 
   @behaviour SymphonyElixir.Runner
 
   require Logger
   alias SymphonyElixir.{Claude.StreamParser, Config, PathSafety, SSH}
+
+  @type session :: %{workspace: Path.t(), worker_host: String.t() | nil, resume: pid()}
 
   @port_line_bytes 1_048_576
 
@@ -67,7 +73,7 @@ defmodule SymphonyElixir.Claude.CliRunner do
          :stderr_to_stdout,
          line: @port_line_bytes,
          cd: String.to_charlist(workspace),
-         args: [~c"-lc", String.to_charlist(local_command(prompt, resume_id))]
+         args: [~c"-lc", String.to_charlist(command_string(prompt, resume_id))]
        ])}
     end
   end
@@ -76,8 +82,6 @@ defmodule SymphonyElixir.Claude.CliRunner do
     remote = "cd #{shell_escape(workspace)} && exec #{command_string(prompt, resume_id)}"
     SSH.start_port(worker_host, remote, line: @port_line_bytes)
   end
-
-  defp local_command(prompt, resume_id), do: command_string(prompt, resume_id)
 
   defp command_string(prompt, resume_id) do
     claude = Config.settings!().claude
@@ -101,9 +105,12 @@ defmodule SymphonyElixir.Claude.CliRunner do
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(port, on_message, resume, timeout_ms, pending <> to_string(chunk))
 
+      # A clean exit (0) without a prior `result` line is the distinct
+      # `:turn_ended_without_result` anomaly (claude exited but never emitted a result).
       {^port, {:exit_status, 0}} ->
         {:error, :turn_ended_without_result}
 
+      # A non-zero exit is the separate `:port_exit` failure (the process itself crashed).
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
