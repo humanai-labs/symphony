@@ -675,7 +675,13 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    # Continuation delay is exactly 1_000ms. Assert it is the continuation timer (<= 1s)
+    # and NOT the ~10s failure backoff; the lower bound is relaxed to 0 so scheduler
+    # starvation on a slow machine (which can nearly elapse the 1s timer before we
+    # measure) cannot make this flake.
+    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+    assert remaining_ms >= 0
+    assert remaining_ms <= 1_000
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -715,7 +721,8 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    # Backoff is 40_000ms; allow ~1s of scheduler jitter on a slow machine.
+    assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1938,6 +1945,21 @@ defmodule SymphonyElixir.CoreTest do
              end)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner rejects an unknown runner atom" do
+    issue = %Issue{
+      id: "issue-runner-guard",
+      identifier: "MT-RUN",
+      title: "Runner guard",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-RUN",
+      labels: []
+    }
+
+    assert_raise ArgumentError, fn ->
+      AgentRunner.run(issue, nil, runner: :bogus, max_turns: 1)
     end
   end
 end

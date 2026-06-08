@@ -61,6 +61,10 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec stall_timeout_ms_for_runner(:codex | :claude) :: non_neg_integer()
+  def stall_timeout_ms_for_runner(:claude), do: settings!().claude.stall_timeout_ms
+  def stall_timeout_ms_for_runner(_runner), do: settings!().codex.stall_timeout_ms
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

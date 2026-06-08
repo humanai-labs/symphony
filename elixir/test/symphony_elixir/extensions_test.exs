@@ -349,6 +349,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_identifier" => "MT-HTTP",
                  "issue_url" => "https://example.org/issues/MT-HTTP",
                  "state" => "In Progress",
+                 "runner" => "claude",
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
@@ -368,6 +369,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
+                 "runner" => "claude",
                  "worker_host" => nil,
                  "workspace_path" => nil
                }
@@ -378,6 +380,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_identifier" => "MT-BLOCKED",
                  "issue_url" => "https://example.org/issues/MT-BLOCKED",
                  "state" => "In Progress",
+                 "runner" => "codex",
                  "error" => "codex turn requires operator input",
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
@@ -732,6 +735,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           identifier: "MT-HTTP",
           issue_url: "https://example.org/issues/MT-HTTP",
           state: "In Progress",
+          runner: :claude,
           session_id: "thread-http",
           turn_count: 7,
           codex_app_server_pid: nil,
@@ -751,7 +755,8 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_url: "https://example.org/issues/MT-RETRY",
           attempt: 2,
           due_in_ms: 2_000,
-          error: "boom"
+          error: "boom",
+          runner: :claude
         }
       ],
       blocked: [
@@ -760,6 +765,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           identifier: "MT-BLOCKED",
           issue_url: "https://example.org/issues/MT-BLOCKED",
           state: "In Progress",
+          runner: :codex,
           error: "codex turn requires operator input",
           worker_host: "dm-dev2",
           workspace_path: "/workspaces/MT-BLOCKED",

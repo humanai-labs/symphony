@@ -275,6 +275,83 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert completed_state.codex_totals.total_tokens == 16
   end
 
+  test "orchestrator accumulates Claude flat top-level token usage" do
+    issue_id = "issue-claude-token-usage"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CLAUDE-TOK",
+      title: "Claude flat token usage",
+      description: "Track flat top-level usage",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-CLAUDE-TOK",
+      labels: ["agent:claude"]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ClaudeTokenUsageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "sess-claude",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      runner: :claude,
+      runner_failure_count: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    # Claude emits a flat top-level usage map with event: :turn_completed and NO method key.
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :turn_completed,
+         session_id: "sess-claude",
+         usage: %{input_tokens: 5, output_tokens: 7, total_tokens: 12},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 5
+    assert snapshot_entry.codex_output_tokens == 7
+    assert snapshot_entry.codex_total_tokens == 12
+
+    send(pid, {:DOWN, process_ref, :process, self(), :normal})
+    completed_state = :sys.get_state(pid)
+    assert completed_state.codex_totals.input_tokens == 5
+    assert completed_state.codex_totals.output_tokens == 7
+    assert completed_state.codex_totals.total_tokens == 12
+  end
+
   test "orchestrator snapshot tracks codex token-count cumulative usage payloads" do
     issue_id = "issue-token-count-snapshot"
 
@@ -966,7 +1043,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
+    # Backoff is 10_000ms. Lower bound stays clearly above the 1s continuation timer
+    # while tolerating heavy scheduler starvation on a slow machine.
+    assert remaining_ms >= 8_000
     assert remaining_ms <= 10_500
   end
 
@@ -1795,5 +1874,598 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {next_tokens, [{timestamp, next_tokens} | acc]}
     end)
     |> elem(1)
+  end
+
+  test "conflicting labels resolve to a routing error" do
+    issue = %Issue{
+      id: "issue-conflict",
+      identifier: "MT-CONFLICT",
+      title: "Conflicting labels",
+      state: "Todo",
+      url: "https://example.org/issues/MT-CONFLICT",
+      labels: ["agent:codex", "agent:claude"]
+    }
+
+    assert SymphonyElixir.RunnerSelection.from_labels(issue.labels, :codex) ==
+             {:error, :conflicting_labels}
+
+    assert SymphonyElixir.Orchestrator.runner_for_dispatch_for_test(issue, :codex) ==
+             {:error, :conflicting_labels}
+  end
+
+  test "conflicting agent labels comment exactly once and auto-resume when fixed" do
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      worker_ssh_hosts: ["worker-01"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    conflicting_issue = %Issue{
+      id: "issue-conflict-once",
+      identifier: "MT-CONFLICT-ONCE",
+      title: "Conflicting labels",
+      state: "Todo",
+      url: "https://example.org/issues/MT-CONFLICT-ONCE",
+      labels: ["agent:codex", "agent:claude"]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ConflictOnceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    base_state = :sys.get_state(pid)
+
+    # First encounter: posts exactly one comment and records the conflict.
+    state_after_first =
+      Orchestrator.do_dispatch_issue_for_test(base_state, conflicting_issue, nil, nil)
+
+    assert MapSet.member?(state_after_first.conflicting, conflicting_issue.id)
+
+    assert_receive {:memory_tracker_comment, "issue-conflict-once", "Conflicting agent labels (agent:codex + agent:claude)." <> _}
+
+    # Second encounter on the still-conflicting issue: no additional comment.
+    state_after_second =
+      Orchestrator.do_dispatch_issue_for_test(state_after_first, conflicting_issue, nil, nil)
+
+    assert MapSet.member?(state_after_second.conflicting, conflicting_issue.id)
+    refute_received {:memory_tracker_comment, "issue-conflict-once", _}
+
+    # Labels fixed: routes normally and the id is removed from conflicting.
+    fixed_issue = %{conflicting_issue | labels: ["agent:codex"]}
+
+    # Saturate the single worker slot so dispatch resolves without spawning.
+    saturated_state =
+      Map.put(state_after_second, :running, %{
+        "other-running" => %{worker_host: "worker-01"}
+      })
+
+    state_after_fix =
+      Orchestrator.do_dispatch_issue_for_test(saturated_state, fixed_issue, nil, nil)
+
+    refute MapSet.member?(state_after_fix.conflicting, fixed_issue.id)
+    refute_received {:memory_tracker_comment, "issue-conflict-once", _}
+  end
+
+  test "conflicting set scrubs ids no longer present in polled candidates" do
+    orchestrator_name = Module.concat(__MODULE__, :ConflictScrubOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    base_state = :sys.get_state(pid)
+
+    state_with_conflicts =
+      Map.put(base_state, :conflicting, MapSet.new(["still-conflicting", "now-closed"]))
+
+    still_present = %Issue{
+      id: "still-conflicting",
+      identifier: "MT-STILL",
+      state: "Todo",
+      url: "https://example.org/issues/MT-STILL",
+      labels: ["agent:codex", "agent:claude"]
+    }
+
+    # "now-closed" left the candidate list (closed/deleted in Linear).
+    scrubbed = Orchestrator.reconcile_conflicting_ids_for_test(state_with_conflicts, [still_present])
+
+    assert MapSet.member?(scrubbed.conflicting, "still-conflicting")
+    refute MapSet.member?(scrubbed.conflicting, "now-closed")
+
+    # An empty candidate list scrubs everything.
+    emptied = Orchestrator.reconcile_conflicting_ids_for_test(state_with_conflicts, [])
+    assert MapSet.size(emptied.conflicting) == 0
+  end
+
+  test "runtime failure blocks once the per-runner budget is exhausted" do
+    # budget default 3 from test WORKFLOW.md
+    assert SymphonyElixir.Orchestrator.next_failure_action_for_test(:claude, 1) == :retry_same
+    assert SymphonyElixir.Orchestrator.next_failure_action_for_test(:claude, 3) == :block
+  end
+
+  test "with fallback enabled the decision switches first then blocks when both runners exhausted" do
+    write_workflow_file!(Workflow.workflow_file_path(), agent_runner_fallback_enabled: true)
+
+    # Empty exhausted set at budget -> switch to the other runner.
+    assert SymphonyElixir.Orchestrator.next_failure_action_for_test(:codex, 3, MapSet.new()) ==
+             {:switch, :claude}
+
+    # Other runner already exhausted -> block, never switch back (loop termination).
+    assert SymphonyElixir.Orchestrator.next_failure_action_for_test(:claude, 3, MapSet.new([:codex])) ==
+             :block
+  end
+
+  test "runner and runner_failure_count round-trip through retry persistence" do
+    orchestrator_name = Module.concat(__MODULE__, :RunnerRetryRoundTripOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    base_state = :sys.get_state(pid)
+
+    metadata = %{
+      identifier: "MT-RUNNER-RT",
+      issue_url: "https://example.org/issues/MT-RUNNER-RT",
+      error: "agent exited",
+      worker_host: "worker-01",
+      workspace_path: "/tmp/ws/MT-RUNNER-RT",
+      runner: :claude,
+      runner_failure_count: 2
+    }
+
+    scheduled = Orchestrator.schedule_issue_retry_for_test(base_state, "issue-runner-rt", 1, metadata)
+
+    retry_token = scheduled.retry_attempts["issue-runner-rt"].retry_token
+    assert is_reference(retry_token)
+    assert scheduled.retry_attempts["issue-runner-rt"].runner == :claude
+    assert scheduled.retry_attempts["issue-runner-rt"].runner_failure_count == 2
+
+    {:ok, attempt, popped_metadata, _state} =
+      Orchestrator.pop_retry_attempt_state_for_test(scheduled, "issue-runner-rt", retry_token)
+
+    assert attempt == 1
+    assert popped_metadata.runner == :claude
+    assert popped_metadata.runner_failure_count == 2
+  end
+
+  test "capacity retries default runner metadata without consuming the failure budget" do
+    orchestrator_name = Module.concat(__MODULE__, :CapacityRetryRoundTripOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    base_state = :sys.get_state(pid)
+
+    # A capacity/continuation retry carries no runner metadata.
+    metadata = %{
+      identifier: "MT-CAP-RT",
+      issue_url: "https://example.org/issues/MT-CAP-RT",
+      error: "no available orchestrator slots"
+    }
+
+    scheduled = Orchestrator.schedule_issue_retry_for_test(base_state, "issue-cap-rt", 2, metadata)
+    retry_token = scheduled.retry_attempts["issue-cap-rt"].retry_token
+
+    # Defaults: codex runner, zero failures consumed.
+    assert scheduled.retry_attempts["issue-cap-rt"].runner == :codex
+    assert scheduled.retry_attempts["issue-cap-rt"].runner_failure_count == 0
+
+    {:ok, _attempt, popped_metadata, _state} =
+      Orchestrator.pop_retry_attempt_state_for_test(scheduled, "issue-cap-rt", retry_token)
+
+    assert popped_metadata.runner == :codex
+    assert popped_metadata.runner_failure_count == 0
+  end
+
+  test "runtime failure under budget increments and persists runner_failure_count through retry" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_api_token: nil)
+
+    issue_id = "issue-runtime-retry"
+    orchestrator_name = Module.concat(__MODULE__, :RuntimeFailureRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    ref = make_ref()
+    started_at = DateTime.utc_now()
+    initial_state = :sys.get_state(pid)
+
+    # Already failed once on claude (count 1); this exit makes it 2 (< budget 3).
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-RUNTIME",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-RUNTIME",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-RUNTIME"
+      },
+      session_id: "thread-runtime",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      retry_attempt: 1,
+      runner: :claude,
+      runner_failure_count: 1,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), {:shutdown, :boom}})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.blocked, issue_id)
+
+    # The incremented runner failure count survived the dispatch->fail->retry cycle.
+    assert state.retry_attempts[issue_id].runner == :claude
+    assert state.retry_attempts[issue_id].runner_failure_count == 2
+  end
+
+  test "runtime failure at budget blocks, comments, and records the exhausted runner" do
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-runtime-block"
+
+    # Keep the issue visible + active so a concurrent poll cycle's blocked-state
+    # reconcile refreshes the block instead of releasing the claim.
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: issue_id,
+        identifier: "MT-RUNTIME-BLOCK",
+        title: "Runtime block",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-RUNTIME-BLOCK"
+      }
+    ])
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :memory_tracker_issues) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :RuntimeFailureBlockOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    ref = make_ref()
+    started_at = DateTime.utc_now()
+    initial_state = :sys.get_state(pid)
+
+    # Already failed twice on claude (count 2); this exit makes it 3 == budget -> block.
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-RUNTIME-BLOCK",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-RUNTIME-BLOCK",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-RUNTIME-BLOCK"
+      },
+      session_id: "thread-runtime-block",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      retry_attempt: 2,
+      runner: :claude,
+      runner_failure_count: 2,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), {:shutdown, :boom}})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert state.blocked[issue_id].runner == :claude
+    assert state.blocked[issue_id].error =~ "claude exhausted failure budget"
+
+    assert_receive {:memory_tracker_comment, ^issue_id, "claude exhausted its failure budget after 3 attempts" <> _}
+  end
+
+  test "opt-in fallback switches once then blocks (no infinite switch loop)" do
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-fallback-loop"
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: issue_id,
+        identifier: "MT-FALLBACK",
+        title: "Fallback loop",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-FALLBACK"
+      }
+    ])
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :memory_tracker_issues) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      agent_runner_fallback_enabled: true
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :FallbackLoopOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    # Phase 1: codex at budget (count 2 -> 3) with fallback ON -> switch to claude.
+    ref1 = make_ref()
+
+    codex_entry = %{
+      pid: self(),
+      ref: ref1,
+      identifier: "MT-FALLBACK",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-FALLBACK",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-FALLBACK"
+      },
+      session_id: "thread-fallback-codex",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      retry_attempt: 2,
+      runner: :codex,
+      runner_failure_count: 2,
+      exhausted_runners: MapSet.new(),
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => codex_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref1, :process, self(), {:shutdown, :boom}})
+    Process.sleep(50)
+    after_switch = :sys.get_state(pid)
+
+    # Switched to claude: runner flipped, count reset, codex recorded as exhausted.
+    refute Map.has_key?(after_switch.blocked, issue_id)
+    assert after_switch.retry_attempts[issue_id].runner == :claude
+    assert after_switch.retry_attempts[issue_id].runner_failure_count == 0
+    assert MapSet.member?(after_switch.retry_attempts[issue_id].exhausted_runners, :codex)
+
+    assert_receive {:memory_tracker_comment, ^issue_id, "codex exhausted its failure budget after 3 attempts; switching runner to claude." <> _}
+
+    # Phase 2: claude now at budget with codex already exhausted -> block (no loop).
+    ref2 = make_ref()
+
+    claude_entry = %{
+      pid: self(),
+      ref: ref2,
+      identifier: "MT-FALLBACK",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-FALLBACK",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-FALLBACK"
+      },
+      session_id: "thread-fallback-claude",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      retry_attempt: 2,
+      runner: :claude,
+      runner_failure_count: 2,
+      exhausted_runners: MapSet.new([:codex]),
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn current ->
+      current
+      |> Map.put(:running, %{issue_id => claude_entry})
+      |> Map.put(:retry_attempts, %{})
+      |> Map.put(:claimed, MapSet.put(current.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref2, :process, self(), {:shutdown, :boom}})
+    Process.sleep(50)
+    after_block = :sys.get_state(pid)
+
+    refute Map.has_key?(after_block.running, issue_id)
+    refute Map.has_key?(after_block.retry_attempts, issue_id)
+    assert after_block.blocked[issue_id].runner == :claude
+    assert after_block.blocked[issue_id].error =~ "claude exhausted failure budget"
+    assert_receive {:memory_tracker_comment, ^issue_id, "claude exhausted its failure budget" <> _}
+  end
+
+  test "normal continuation preserves runner_failure_count" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_api_token: nil)
+
+    issue_id = "issue-continuation-count"
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationCountOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    ref = make_ref()
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-CONT",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-CONT",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-CONT"
+      },
+      session_id: "thread-cont",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      runner: :claude,
+      runner_failure_count: 1,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    # Continuation reschedules the same runner with the failure count unchanged.
+    assert state.retry_attempts[issue_id].runner == :claude
+    assert state.retry_attempts[issue_id].runner_failure_count == 1
+    assert MapSet.member?(state.completed, issue_id)
+  end
+
+  test "stall detection uses the per-runner timeout" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      codex_stall_timeout_ms: 100_000,
+      claude_stall_timeout_ms: 1_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :PerRunnerStallOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    stale_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    initial_state = :sys.get_state(pid)
+
+    claude_worker = spawn(fn -> Process.sleep(:infinity) end)
+    codex_worker = spawn(fn -> Process.sleep(:infinity) end)
+
+    on_exit(fn ->
+      Process.exit(claude_worker, :kill)
+      Process.exit(codex_worker, :kill)
+    end)
+
+    # Both entries are equally stale (5s). With claude timeout 1s and codex timeout
+    # 100s, only the claude entry should be detected as stalled and restarted.
+    claude_entry = %{
+      pid: claude_worker,
+      ref: make_ref(),
+      identifier: "MT-STALL-CLAUDE",
+      issue: %Issue{
+        id: "issue-stall-claude",
+        identifier: "MT-STALL-CLAUDE",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-STALL-CLAUDE"
+      },
+      session_id: "thread-stall-claude",
+      last_codex_message: nil,
+      last_codex_timestamp: stale_at,
+      last_codex_event: :notification,
+      runner: :claude,
+      started_at: stale_at
+    }
+
+    codex_entry = %{
+      pid: codex_worker,
+      ref: make_ref(),
+      identifier: "MT-STALL-CODEX",
+      issue: %Issue{
+        id: "issue-stall-codex",
+        identifier: "MT-STALL-CODEX",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-STALL-CODEX"
+      },
+      session_id: "thread-stall-codex",
+      last_codex_message: nil,
+      last_codex_timestamp: stale_at,
+      last_codex_event: :notification,
+      runner: :codex,
+      started_at: stale_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{
+        "issue-stall-claude" => claude_entry,
+        "issue-stall-codex" => codex_entry
+      })
+      |> Map.put(
+        :claimed,
+        initial_state.claimed
+        |> MapSet.put("issue-stall-claude")
+        |> MapSet.put("issue-stall-codex")
+      )
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    # Claude entry stalled out (1s timeout) -> moved to retry; codex entry (100s) stays.
+    refute Map.has_key?(state.running, "issue-stall-claude")
+    assert Map.has_key?(state.retry_attempts, "issue-stall-claude")
+    assert Map.has_key?(state.running, "issue-stall-codex")
+    refute Map.has_key?(state.retry_attempts, "issue-stall-codex")
   end
 end

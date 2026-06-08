@@ -88,11 +88,20 @@ defmodule SymphonyElixir.MixProject do
   end
 
   defp escript do
-    [
-      app: nil,
-      main_module: SymphonyElixir.CLI,
-      name: "symphony",
-      path: "bin/symphony"
-    ]
+    case System.get_env("ESCRIPT_TARGET") do
+      "mcp" ->
+        [
+          main_module: SymphonyElixir.Claude.LinearMcpServer,
+          name: "symphony_linear_mcp"
+        ]
+
+      _ ->
+        [
+          app: nil,
+          main_module: SymphonyElixir.CLI,
+          name: "symphony",
+          path: "bin/symphony"
+        ]
+    end
   end
 end

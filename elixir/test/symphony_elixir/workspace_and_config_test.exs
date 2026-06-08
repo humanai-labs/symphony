@@ -1368,4 +1368,65 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "agent runner knobs default and parse" do
+    assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(%{})
+    assert settings.agent.default_runner == "codex"
+    assert settings.agent.runner_failure_budget == 3
+    assert settings.agent.runner_fallback_enabled == false
+
+    assert {:ok, custom} =
+             SymphonyElixir.Config.Schema.parse(%{
+               "agent" => %{
+                 "default_runner" => "claude",
+                 "runner_failure_budget" => 5,
+                 "runner_fallback_enabled" => true
+               }
+             })
+
+    assert custom.agent.default_runner == "claude"
+    assert custom.agent.runner_failure_budget == 5
+    assert custom.agent.runner_fallback_enabled == true
+  end
+
+  test "agent rejects an unknown default_runner" do
+    assert {:error, {:invalid_workflow_config, message}} =
+             SymphonyElixir.Config.Schema.parse(%{"agent" => %{"default_runner" => "gpt"}})
+
+    assert message =~ "default_runner"
+  end
+
+  test "claude block defaults and parses" do
+    assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(%{})
+    assert settings.claude.command == "claude"
+    assert settings.claude.permission_mode == "acceptEdits"
+    assert settings.claude.turn_timeout_ms == 1_800_000
+    assert settings.claude.stall_timeout_ms == 600_000
+    assert is_list(settings.claude.allowed_tools)
+
+    assert {:ok, custom} =
+             SymphonyElixir.Config.Schema.parse(%{
+               "claude" => %{"command" => "claude-next", "permission_mode" => "plan"}
+             })
+
+    assert custom.claude.command == "claude-next"
+    assert custom.claude.permission_mode == "plan"
+  end
+
+  test "claude rejects an unknown permission_mode" do
+    assert {:error, {:invalid_workflow_config, message}} =
+             SymphonyElixir.Config.Schema.parse(%{"claude" => %{"permission_mode" => "yolo"}})
+
+    assert message =~ "permission_mode"
+  end
+
+  test "stall timeout resolves per runner" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms: 111,
+      claude_stall_timeout_ms: 222
+    )
+
+    assert SymphonyElixir.Config.stall_timeout_ms_for_runner(:codex) == 111
+    assert SymphonyElixir.Config.stall_timeout_ms_for_runner(:claude) == 222
+  end
 end

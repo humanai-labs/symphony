@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      conflicting: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
@@ -203,6 +204,7 @@ defmodule SymphonyElixir.Orchestrator do
     else
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
+      # Continuation: same runner continues, failure count + exhausted set unchanged.
       state
       |> complete_issue(issue_id)
       |> schedule_issue_retry(issue_id, 1, %{
@@ -210,7 +212,10 @@ defmodule SymphonyElixir.Orchestrator do
         issue_url: running_entry.issue.url,
         delay_type: :continuation,
         worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
+        workspace_path: Map.get(running_entry, :workspace_path),
+        runner: Map.get(running_entry, :runner, :codex),
+        runner_failure_count: Map.get(running_entry, :runner_failure_count, 0),
+        exhausted_runners: Map.get(running_entry, :exhausted_runners, MapSet.new())
       })
     end
   end
@@ -232,17 +237,60 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
-    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+    runner = Map.get(running_entry, :runner, :codex)
+    failure_count = Map.get(running_entry, :runner_failure_count, 0) + 1
+    exhausted = Map.get(running_entry, :exhausted_runners, MapSet.new())
 
-    next_attempt = next_retry_attempt_from_running(running_entry)
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} runner=#{runner} failure_count=#{failure_count} reason=#{inspect(reason)}; deciding next action")
 
-    schedule_issue_retry(state, issue_id, next_attempt, %{
+    base_metadata = %{
       identifier: running_entry.identifier,
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
-    })
+      workspace_path: Map.get(running_entry, :workspace_path),
+      runner: runner,
+      runner_failure_count: failure_count,
+      exhausted_runners: exhausted
+    }
+
+    case next_failure_action(runner, failure_count, exhausted) do
+      :retry_same ->
+        schedule_issue_retry(state, issue_id, next_retry_attempt_from_running(running_entry), base_metadata)
+
+      {:switch, other_runner} ->
+        # Record the just-exhausted runner so a future failure on `other_runner`
+        # blocks instead of switching back (no infinite A->B->A loop).
+        Tracker.create_comment(
+          issue_id,
+          "#{runner} exhausted its failure budget after #{failure_count} attempts; switching runner to #{other_runner}."
+        )
+
+        schedule_issue_retry(
+          state,
+          issue_id,
+          next_retry_attempt_from_running(running_entry),
+          %{
+            base_metadata
+            | runner: other_runner,
+              runner_failure_count: 0,
+              exhausted_runners: MapSet.put(exhausted, runner)
+          }
+        )
+
+      :block ->
+        Tracker.create_comment(
+          issue_id,
+          "#{runner} exhausted its failure budget after #{failure_count} attempts; moved to Blocked."
+        )
+
+        block_issue_from_entry(
+          state,
+          issue_id,
+          running_entry,
+          "#{runner} exhausted failure budget: #{inspect(reason)}"
+        )
+    end
   end
 
   defp maybe_dispatch(%State{} = state) do
@@ -254,7 +302,7 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      choose_issues(issues, reconcile_conflicting_ids(state, issues))
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -397,6 +445,58 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec runner_for_dispatch_for_test(Issue.t(), :codex | :claude) ::
+          {:ok, :codex | :claude} | {:error, :conflicting_labels}
+  def runner_for_dispatch_for_test(%Issue{} = issue, default), do: resolve_runner(issue, default)
+
+  defp resolve_runner(%Issue{labels: labels}, default) when is_list(labels) do
+    SymphonyElixir.RunnerSelection.from_labels(labels, default)
+  end
+
+  defp resolve_runner(_issue, default), do: {:ok, default}
+
+  @doc false
+  @spec next_failure_action_for_test(:codex | :claude, non_neg_integer()) ::
+          :retry_same | :block | {:switch, atom()}
+  def next_failure_action_for_test(runner, failure_count) do
+    next_failure_action(runner, failure_count, MapSet.new())
+  end
+
+  @doc false
+  @spec next_failure_action_for_test(:codex | :claude, non_neg_integer(), MapSet.t()) ::
+          :retry_same | :block | {:switch, atom()}
+  def next_failure_action_for_test(runner, failure_count, exhausted) do
+    next_failure_action(runner, failure_count, exhausted)
+  end
+
+  defp next_failure_action(runner, failure_count, exhausted) do
+    agent = Config.settings!().agent
+
+    SymphonyElixir.RunnerFailurePolicy.on_runtime_failure(
+      failure_count,
+      agent.runner_failure_budget,
+      fallback_enabled: agent.runner_fallback_enabled,
+      current: runner,
+      exhausted: exhausted
+    )
+  end
+
+  @doc false
+  @spec schedule_issue_retry_for_test(term(), String.t(), non_neg_integer() | nil, map()) :: term()
+  def schedule_issue_retry_for_test(%State{} = state, issue_id, attempt, metadata)
+      when is_binary(issue_id) and is_map(metadata) do
+    schedule_issue_retry(state, issue_id, attempt, metadata)
+  end
+
+  @doc false
+  @spec pop_retry_attempt_state_for_test(term(), String.t(), reference()) ::
+          {:ok, non_neg_integer(), map(), term()} | :missing
+  def pop_retry_attempt_state_for_test(%State{} = state, issue_id, retry_token)
+      when is_binary(issue_id) and is_reference(retry_token) do
+    pop_retry_attempt_state(state, issue_id, retry_token)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -572,22 +672,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
-    timeout_ms = Config.settings!().codex.stall_timeout_ms
+    if map_size(state.running) == 0 do
+      state
+    else
+      now = DateTime.utc_now()
 
-    cond do
-      timeout_ms <= 0 ->
-        state
-
-      map_size(state.running) == 0 ->
-        state
-
-      true ->
-        now = DateTime.utc_now()
-
-        Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-          maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
-        end)
+      Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+        # Per-runner stall timeout: pick by the running entry's runner.
+        timeout_ms = Config.stall_timeout_ms_for_runner(Map.get(running_entry, :runner, :codex))
+        maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
+      end)
     end
+  end
+
+  defp maybe_restart_stalled_issue(state, _issue_id, _running_entry, _now, timeout_ms)
+       when timeout_ms <= 0 do
+    state
   end
 
   defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
@@ -618,12 +718,16 @@ defmodule SymphonyElixir.Orchestrator do
 
         next_attempt = next_retry_attempt_from_running(running_entry)
 
+        # stall restart: not a runner failure (carry runner + count + exhausted unchanged)
         state
         |> terminate_running_issue(issue_id, false)
         |> schedule_issue_retry(issue_id, next_attempt, %{
           identifier: identifier,
           issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
+          error: "stalled for #{elapsed_ms}ms without codex activity",
+          runner: Map.get(running_entry, :runner, :codex),
+          runner_failure_count: Map.get(running_entry, :runner_failure_count, 0),
+          exhausted_runners: Map.get(running_entry, :exhausted_runners, MapSet.new())
         })
       end
     else
@@ -750,6 +854,7 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
+      runner: Map.get(running_entry, :runner, :codex),
       error: error,
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
@@ -764,6 +869,24 @@ defmodule SymphonyElixir.Orchestrator do
         claimed: MapSet.put(state.claimed, issue_id),
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
+  end
+
+  @doc false
+  @spec reconcile_conflicting_ids_for_test(term(), [Issue.t()]) :: term()
+  def reconcile_conflicting_ids_for_test(%State{} = state, issues) when is_list(issues) do
+    reconcile_conflicting_ids(state, issues)
+  end
+
+  defp reconcile_conflicting_ids(%State{} = state, issues) when is_list(issues) do
+    visible =
+      issues
+      |> Enum.flat_map(fn
+        %Issue{id: id} when is_binary(id) -> [id]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    %{state | conflicting: MapSet.filter(state.conflicting, &MapSet.member?(visible, &1))}
   end
 
   defp choose_issues(issues, state) do
@@ -906,10 +1029,26 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(
+         %State{} = state,
+         issue,
+         attempt \\ nil,
+         preferred_worker_host \\ nil,
+         preferred_runner \\ nil,
+         runner_failure_count \\ 0,
+         exhausted_runners \\ MapSet.new()
+       ) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        do_dispatch_issue(
+          state,
+          refreshed_issue,
+          attempt,
+          preferred_worker_host,
+          preferred_runner,
+          runner_failure_count,
+          exhausted_runners
+        )
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -926,22 +1065,97 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+  @doc false
+  @spec do_dispatch_issue_for_test(term(), Issue.t(), term(), String.t() | nil) :: term()
+  def do_dispatch_issue_for_test(%State{} = state, %Issue{} = issue, attempt, preferred_worker_host) do
+    do_dispatch_issue(state, issue, attempt, preferred_worker_host, nil, 0, MapSet.new())
+  end
+
+  defp do_dispatch_issue(
+         %State{} = state,
+         issue,
+         attempt,
+         preferred_worker_host,
+         preferred_runner,
+         runner_failure_count,
+         exhausted_runners
+       ) do
     recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
-      :no_worker_capacity ->
-        Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
-        state
+    case dispatch_runner(issue, preferred_runner) do
+      {:error, :conflicting_labels} ->
+        handle_conflicting_labels(state, issue)
 
-      worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+      {:ok, runner} ->
+        # Conflict (if any) resolved — stop tracking so a future conflict re-comments.
+        state = %{state | conflicting: MapSet.delete(state.conflicting, issue.id)}
+
+        case select_worker_host(state, preferred_worker_host) do
+          :no_worker_capacity ->
+            Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+
+            state
+
+          worker_host ->
+            spawn_issue_on_worker_host(
+              state,
+              issue,
+              attempt,
+              recipient,
+              worker_host,
+              runner,
+              runner_failure_count,
+              exhausted_runners
+            )
+        end
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  # When a retry already chose a runner (e.g. an opt-in switch), honour it directly and
+  # SKIP label re-resolution so the decision sticks. Only first dispatch (nil) re-derives
+  # the runner from the issue's labels (including conflicting-label handling).
+  defp dispatch_runner(_issue, preferred_runner) when preferred_runner in [:codex, :claude] do
+    {:ok, preferred_runner}
+  end
+
+  defp dispatch_runner(issue, _preferred_runner) do
+    default_runner = String.to_existing_atom(Config.settings!().agent.default_runner)
+    resolve_runner(issue, default_runner)
+  end
+
+  defp handle_conflicting_labels(%State{} = state, %Issue{} = issue) do
+    if MapSet.member?(state.conflicting, issue.id) do
+      state
+    else
+      Logger.warning("Skipping dispatch; conflicting agent labels for #{issue_context(issue)}")
+
+      case Tracker.create_comment(
+             issue.id,
+             "Conflicting agent labels (agent:codex + agent:claude). Skipped — keep exactly one."
+           ) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Failed to post conflict comment for #{issue_context(issue)}: #{inspect(reason)}")
+      end
+
+      %{state | conflicting: MapSet.put(state.conflicting, issue.id)}
+    end
+  end
+
+  defp spawn_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         runner,
+         runner_failure_count,
+         exhausted_runners
+       ) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host, runner: runner)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -969,6 +1183,9 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            runner: runner,
+            runner_failure_count: runner_failure_count,
+            exhausted_runners: exhausted_runners,
             started_at: DateTime.utc_now()
           })
 
@@ -983,11 +1200,15 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
+        # capacity retry: not a runner failure (preserve runner + count + exhausted unchanged)
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
           issue_url: issue.url,
           error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
+          worker_host: worker_host,
+          runner: runner,
+          runner_failure_count: runner_failure_count,
+          exhausted_runners: exhausted_runners
         })
     end
   end
@@ -1033,6 +1254,9 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    runner = pick_retry_runner(previous_retry, metadata)
+    runner_failure_count = pick_retry_runner_failure_count(previous_retry, metadata)
+    exhausted_runners = pick_retry_exhausted_runners(previous_retry, metadata)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1056,7 +1280,10 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            runner: runner,
+            runner_failure_count: runner_failure_count,
+            exhausted_runners: exhausted_runners
           })
     }
   end
@@ -1069,7 +1296,10 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          runner: Map.get(retry_entry, :runner, :codex),
+          runner_failure_count: Map.get(retry_entry, :runner_failure_count, 0),
+          exhausted_runners: Map.get(retry_entry, :exhausted_runners, MapSet.new())
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1163,10 +1393,20 @@ defmodule SymphonyElixir.Orchestrator do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+      {:noreply,
+       dispatch_issue(
+         state,
+         issue,
+         attempt,
+         metadata[:worker_host],
+         Map.get(metadata, :runner),
+         Map.get(metadata, :runner_failure_count, 0),
+         Map.get(metadata, :exhausted_runners, MapSet.new())
+       )}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
+      # capacity retry: not a runner failure (Map.merge preserves runner + count unchanged)
       {:noreply,
        schedule_issue_retry(
          state,
@@ -1184,6 +1424,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
+        conflicting: MapSet.delete(state.conflicting, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
@@ -1230,6 +1471,32 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp pick_retry_runner(previous_retry, metadata) do
+    cond do
+      is_atom(metadata[:runner]) and not is_nil(metadata[:runner]) -> metadata[:runner]
+      is_atom(Map.get(previous_retry, :runner)) and not is_nil(Map.get(previous_retry, :runner)) -> Map.get(previous_retry, :runner)
+      true -> :codex
+    end
+  end
+
+  # Explicit integer resolution: a legitimate 0 must NOT fall through to a stale
+  # previous value (which `||` would do, treating 0 as falsy).
+  defp pick_retry_runner_failure_count(previous_retry, metadata) do
+    cond do
+      is_integer(metadata[:runner_failure_count]) -> metadata[:runner_failure_count]
+      is_integer(Map.get(previous_retry, :runner_failure_count)) -> Map.get(previous_retry, :runner_failure_count)
+      true -> 0
+    end
+  end
+
+  defp pick_retry_exhausted_runners(previous_retry, metadata) do
+    cond do
+      match?(%MapSet{}, metadata[:exhausted_runners]) -> metadata[:exhausted_runners]
+      match?(%MapSet{}, Map.get(previous_retry, :exhausted_runners)) -> Map.get(previous_retry, :exhausted_runners)
+      true -> MapSet.new()
+    end
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
@@ -1391,6 +1658,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          runner: Map.get(metadata, :runner, :codex),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1406,7 +1674,9 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry, :issue_url),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          runner: Map.get(retry, :runner, :codex),
+          runner_failure_count: Map.get(retry, :runner_failure_count, 0)
         }
       end)
 
@@ -1421,6 +1691,7 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: Map.get(metadata, :session_id),
+          runner: Map.get(metadata, :runner, :codex),
           error: Map.get(metadata, :error),
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
@@ -1712,8 +1983,18 @@ defmodule SymphonyElixir.Orchestrator do
 
     Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
       Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
+      Enum.find_value(payloads, &flat_token_usage_from_payload/1) ||
       %{}
   end
+
+  # Claude (and any runner) emitting a flat top-level token map:
+  # %{input_tokens:, output_tokens:, total_tokens:}. Fires only when the two Codex
+  # extractors above miss, so it cannot regress Codex token accounting.
+  defp flat_token_usage_from_payload(payload) when is_map(payload) do
+    if integer_token_map?(payload), do: payload, else: nil
+  end
+
+  defp flat_token_usage_from_payload(_payload), do: nil
 
   defp extract_rate_limits(update) do
     rate_limits_from_payload(update[:rate_limits]) ||
