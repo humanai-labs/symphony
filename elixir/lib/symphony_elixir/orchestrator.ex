@@ -450,13 +450,13 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec runner_for_dispatch_for_test(Issue.t(), :codex | :claude) ::
           {:ok, :codex | :claude} | {:error, :conflicting_labels}
-  def runner_for_dispatch_for_test(%Issue{} = issue, default), do: resolve_runner(issue, default)
+  def runner_for_dispatch_for_test(%Issue{} = issue, default), do: resolve_runner(issue, default, [])
 
-  defp resolve_runner(%Issue{labels: labels}, default) when is_list(labels) do
-    SymphonyElixir.RunnerSelection.from_labels(labels, default)
+  defp resolve_runner(%Issue{labels: labels}, default, opts) when is_list(labels) do
+    SymphonyElixir.RunnerSelection.from_labels(labels, default, opts)
   end
 
-  defp resolve_runner(_issue, default), do: {:ok, default}
+  defp resolve_runner(_issue, default, _opts), do: {:ok, default}
 
   @doc false
   @spec next_failure_action_for_test(:codex | :claude, non_neg_integer()) ::
@@ -1112,6 +1112,9 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, :conflicting_labels} ->
         handle_conflicting_labels(state, issue)
 
+      {:error, :no_runner_specified} ->
+        handle_missing_runner(state, issue)
+
       {:ok, runner} ->
         # Conflict (if any) resolved — stop tracking so a future conflict re-comments.
         state = %{state | conflicting: MapSet.delete(state.conflicting, issue.id)}
@@ -1145,8 +1148,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_runner(issue, _preferred_runner) do
-    default_runner = String.to_existing_atom(Config.settings!().agent.default_runner)
-    resolve_runner(issue, default_runner)
+    agent = Config.settings!().agent
+    default_runner = String.to_existing_atom(agent.default_runner)
+    resolve_runner(issue, default_runner, require_explicit: agent.require_explicit_runner)
   end
 
   defp handle_conflicting_labels(%State{} = state, %Issue{} = issue) do
@@ -1168,6 +1172,16 @@ defmodule SymphonyElixir.Orchestrator do
 
       %{state | conflicting: MapSet.put(state.conflicting, issue.id)}
     end
+  end
+
+  # require_explicit_runner is on and the issue carries no agent:* label. The
+  # execution-ownership contract is mandatory here, so we refuse to start work
+  # (no claim, no spawn) until a runner is chosen. Left unclaimed, so the issue
+  # is re-evaluated and picked up immediately once a label is added.
+  defp handle_missing_runner(%State{} = state, %Issue{} = issue) do
+    Logger.info("Skipping dispatch; require_explicit_runner is on and no agent:* label for #{issue_context(issue)}")
+
+    state
   end
 
   defp spawn_issue_on_worker_host(

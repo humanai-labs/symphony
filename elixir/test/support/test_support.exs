@@ -111,6 +111,7 @@ defmodule SymphonyElixir.TestSupport do
           agent_default_runner: "codex",
           agent_runner_failure_budget: 3,
           agent_runner_fallback_enabled: false,
+          agent_require_explicit_runner: false,
           claude_command: "claude",
           claude_permission_mode: "acceptEdits",
           claude_allowed_tools: [
@@ -186,6 +187,7 @@ defmodule SymphonyElixir.TestSupport do
     agent_default_runner = Keyword.get(config, :agent_default_runner)
     agent_runner_failure_budget = Keyword.get(config, :agent_runner_failure_budget)
     agent_runner_fallback_enabled = Keyword.get(config, :agent_runner_fallback_enabled)
+    agent_require_explicit_runner = Keyword.get(config, :agent_require_explicit_runner)
     claude_command = Keyword.get(config, :claude_command)
     claude_permission_mode = Keyword.get(config, :claude_permission_mode)
     claude_allowed_tools = Keyword.get(config, :claude_allowed_tools)
@@ -218,6 +220,7 @@ defmodule SymphonyElixir.TestSupport do
         "  default_runner: #{yaml_value(agent_default_runner)}",
         "  runner_failure_budget: #{yaml_value(agent_runner_failure_budget)}",
         "  runner_fallback_enabled: #{yaml_value(agent_runner_fallback_enabled)}",
+        "  require_explicit_runner: #{yaml_value(agent_require_explicit_runner)}",
         "  reserved_concurrent_agents_by_state: #{yaml_value(reserved_concurrent_agents_by_state)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",

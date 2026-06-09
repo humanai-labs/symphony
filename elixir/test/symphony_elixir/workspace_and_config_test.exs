@@ -1519,19 +1519,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.agent.default_runner == "codex"
     assert settings.agent.runner_failure_budget == 3
     assert settings.agent.runner_fallback_enabled == false
+    assert settings.agent.require_explicit_runner == false
 
     assert {:ok, custom} =
              Schema.parse(%{
                "agent" => %{
                  "default_runner" => "claude",
                  "runner_failure_budget" => 5,
-                 "runner_fallback_enabled" => true
+                 "runner_fallback_enabled" => true,
+                 "require_explicit_runner" => true
                }
              })
 
     assert custom.agent.default_runner == "claude"
     assert custom.agent.runner_failure_budget == 5
     assert custom.agent.runner_fallback_enabled == true
+    assert custom.agent.require_explicit_runner == true
   end
 
   test "agent rejects an unknown default_runner" do
