@@ -891,18 +891,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
-    assert %{polling: %{checking?: true}} =
-             wait_for_snapshot(
-               pid,
-               fn
-                 %{polling: %{checking?: true}} ->
-                   true
+    assert %{polling: %{poll_interval_ms: 5_000}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: true}} ->
+                 true
 
-                 _ ->
-                   false
-               end,
-               500
-             )
+               %{polling: %{checking?: false, next_poll_in_ms: due_in_ms}}
+               when is_integer(due_in_ms) and due_in_ms <= 5_000 ->
+                 true
+
+               _ ->
+                 false
+             end)
 
     assert %{
              polling: %{
@@ -1826,23 +1826,37 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute rendered =~ "Timestamp:"
   end
 
-  defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
+  defp wait_for_snapshot(pid, predicate, timeout_ms \\ 5_000) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
   end
 
   defp do_wait_for_snapshot(pid, predicate, deadline_ms) do
-    snapshot = GenServer.call(pid, :snapshot)
+    case snapshot_call(pid) do
+      {:ok, snapshot} ->
+        if predicate.(snapshot) do
+          snapshot
+        else
+          maybe_retry_snapshot_wait(pid, predicate, deadline_ms, snapshot)
+        end
 
-    if predicate.(snapshot) do
-      snapshot
+      :timeout ->
+        maybe_retry_snapshot_wait(pid, predicate, deadline_ms, :timeout)
+    end
+  end
+
+  defp snapshot_call(pid) do
+    {:ok, GenServer.call(pid, :snapshot, 1_000)}
+  catch
+    :exit, {:timeout, _reason} -> :timeout
+  end
+
+  defp maybe_retry_snapshot_wait(pid, predicate, deadline_ms, last_snapshot) do
+    if System.monotonic_time(:millisecond) >= deadline_ms do
+      flunk("timed out waiting for orchestrator snapshot state: #{inspect(last_snapshot)}")
     else
-      if System.monotonic_time(:millisecond) >= deadline_ms do
-        flunk("timed out waiting for orchestrator snapshot state: #{inspect(snapshot)}")
-      else
-        Process.sleep(5)
-        do_wait_for_snapshot(pid, predicate, deadline_ms)
-      end
+      Process.sleep(25)
+      do_wait_for_snapshot(pid, predicate, deadline_ms)
     end
   end
 

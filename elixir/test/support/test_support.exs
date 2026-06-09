@@ -125,6 +125,7 @@ defmodule SymphonyElixir.TestSupport do
           claude_turn_timeout_ms: 1_800_000,
           claude_stall_timeout_ms: 600_000,
           claude_mcp_server_path: nil,
+          reserved_concurrent_agents_by_state: %{},
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -163,6 +164,7 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    reserved_concurrent_agents_by_state = Keyword.get(config, :reserved_concurrent_agents_by_state)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -216,6 +218,7 @@ defmodule SymphonyElixir.TestSupport do
         "  default_runner: #{yaml_value(agent_default_runner)}",
         "  runner_failure_budget: #{yaml_value(agent_runner_failure_budget)}",
         "  runner_fallback_enabled: #{yaml_value(agent_runner_fallback_enabled)}",
+        "  reserved_concurrent_agents_by_state: #{yaml_value(reserved_concurrent_agents_by_state)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",

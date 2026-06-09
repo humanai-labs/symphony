@@ -595,6 +595,138 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "reserved state capacity keeps the merge lane open while development is busy" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      max_concurrent_agents: 10,
+      max_concurrent_agents_by_state: %{"Merging" => 1},
+      reserved_concurrent_agents_by_state: %{"Merging" => 1}
+    )
+
+    running =
+      Map.new(1..9, fn index ->
+        issue = %Issue{
+          id: "dev-#{index}",
+          identifier: "MT-#{index}",
+          title: "Development #{index}",
+          state: "In Progress"
+        }
+
+        {issue.id, %{issue: issue}}
+      end)
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 10,
+      running: running,
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    dev_issue = %Issue{
+      id: "dev-10",
+      identifier: "MT-10",
+      title: "Development 10",
+      state: "In Progress"
+    }
+
+    merge_issue = %Issue{
+      id: "merge-1",
+      identifier: "MT-MERGE",
+      title: "Merge approved work",
+      state: "Merging"
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(dev_issue, state)
+    assert Orchestrator.should_dispatch_issue_for_test(merge_issue, state)
+  end
+
+  test "development can use the last slot once the merge reservation is occupied" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      max_concurrent_agents: 10,
+      max_concurrent_agents_by_state: %{"Merging" => 1},
+      reserved_concurrent_agents_by_state: %{"Merging" => 1}
+    )
+
+    running =
+      Map.new(1..8, fn index ->
+        issue = %Issue{
+          id: "dev-#{index}",
+          identifier: "MT-#{index}",
+          title: "Development #{index}",
+          state: "In Progress"
+        }
+
+        {issue.id, %{issue: issue}}
+      end)
+      |> Map.put("merge-1", %{
+        issue: %Issue{
+          id: "merge-1",
+          identifier: "MT-MERGE",
+          title: "Merge approved work",
+          state: "Merging"
+        }
+      })
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 10,
+      running: running,
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    dev_issue = %Issue{
+      id: "dev-9",
+      identifier: "MT-9",
+      title: "Development 9",
+      state: "In Progress"
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(dev_issue, state)
+  end
+
+  test "todo dispatch marks issue in progress before running agent" do
+    issue = %Issue{
+      id: "issue-1007",
+      identifier: "MT-1007",
+      title: "Run me",
+      state: "Todo"
+    }
+
+    updater = fn issue_id, state_name ->
+      send(self(), {:state_update, issue_id, state_name})
+      :ok
+    end
+
+    assert %Issue{state: "In Progress"} =
+             Orchestrator.mark_dispatch_started_for_test(issue, updater)
+
+    assert_received {:state_update, "issue-1007", "In Progress"}
+  end
+
+  test "non-todo dispatch does not rewrite issue state" do
+    for state_name <- ["Rework", "Merging", "In Progress"] do
+      issue = %Issue{
+        id: "issue-#{state_name}",
+        identifier: "MT-#{state_name}",
+        title: "Run me",
+        state: state_name
+      }
+
+      updater = fn issue_id, next_state ->
+        send(self(), {:unexpected_state_update, issue_id, next_state})
+        :ok
+      end
+
+      assert %Issue{state: ^state_name} =
+               Orchestrator.mark_dispatch_started_for_test(issue, updater)
+    end
+
+    refute_received {:unexpected_state_update, _, _}
+  end
+
   test "dispatch revalidation skips stale todo issue once a non-terminal blocker appears" do
     stale_issue = %Issue{
       id: "blocked-2",
@@ -1018,12 +1150,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         todo: 1
         "In Progress": 4
         "In Review": 2
+      reserved_concurrent_agents_by_state:
+        Merging: 1
     ---
     """
 
     File.write!(Workflow.workflow_file_path(), workflow)
 
     assert Config.settings!().agent.max_concurrent_agents == 10
+    assert Config.settings!().agent.reserved_concurrent_agents_by_state == %{"merging" => 1}
     assert Config.max_concurrent_agents_for_state("Todo") == 1
     assert Config.max_concurrent_agents_for_state("In Progress") == 4
     assert Config.max_concurrent_agents_for_state("In Review") == 2
@@ -1033,6 +1168,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 2)
     assert :ok = Config.validate!()
     assert Config.settings!().worker.max_concurrent_agents_per_host == 2
+  end
+
+  test "config rejects reserved agent capacity above the global limit" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_concurrent_agents: 2,
+      reserved_concurrent_agents_by_state: %{"Merging" => 2, "Rework" => 1}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.reserved_concurrent_agents_by_state"
   end
 
   test "schema helpers cover custom type and state limit validation" do
@@ -1370,13 +1515,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "agent runner knobs default and parse" do
-    assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(%{})
+    assert {:ok, settings} = Schema.parse(%{})
     assert settings.agent.default_runner == "codex"
     assert settings.agent.runner_failure_budget == 3
     assert settings.agent.runner_fallback_enabled == false
 
     assert {:ok, custom} =
-             SymphonyElixir.Config.Schema.parse(%{
+             Schema.parse(%{
                "agent" => %{
                  "default_runner" => "claude",
                  "runner_failure_budget" => 5,
@@ -1391,13 +1536,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "agent rejects an unknown default_runner" do
     assert {:error, {:invalid_workflow_config, message}} =
-             SymphonyElixir.Config.Schema.parse(%{"agent" => %{"default_runner" => "gpt"}})
+             Schema.parse(%{"agent" => %{"default_runner" => "gpt"}})
 
     assert message =~ "default_runner"
   end
 
   test "claude block defaults and parses" do
-    assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(%{})
+    assert {:ok, settings} = Schema.parse(%{})
     assert settings.claude.command == "claude"
     assert settings.claude.permission_mode == "acceptEdits"
     assert settings.claude.turn_timeout_ms == 1_800_000
@@ -1405,7 +1550,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert is_list(settings.claude.allowed_tools)
 
     assert {:ok, custom} =
-             SymphonyElixir.Config.Schema.parse(%{
+             Schema.parse(%{
                "claude" => %{"command" => "claude-next", "permission_mode" => "plan"}
              })
 
@@ -1415,7 +1560,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "claude rejects an unknown permission_mode" do
     assert {:error, {:invalid_workflow_config, message}} =
-             SymphonyElixir.Config.Schema.parse(%{"claude" => %{"permission_mode" => "yolo"}})
+             Schema.parse(%{"claude" => %{"permission_mode" => "yolo"}})
 
     assert message =~ "permission_mode"
   end

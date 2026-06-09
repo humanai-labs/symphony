@@ -499,6 +499,12 @@ defmodule SymphonyElixir.Orchestrator do
     pop_retry_attempt_state(state, issue_id, retry_token)
   end
 
+  @doc false
+  @spec mark_dispatch_started_for_test(Issue.t(), (String.t(), String.t() -> term())) :: Issue.t()
+  def mark_dispatch_started_for_test(%Issue{} = issue, updater) when is_function(updater, 2) do
+    mark_dispatch_started(issue, updater)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -751,8 +757,6 @@ defmodule SymphonyElixir.Orchestrator do
     Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
   end
 
-  defp last_activity_timestamp(_running_entry), do: nil
-
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
     Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
@@ -936,6 +940,7 @@ defmodule SymphonyElixir.Orchestrator do
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
+      reserved_slots_available?(issue, state) and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
   end
@@ -949,6 +954,27 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp state_slots_available?(_issue, _running), do: false
+
+  defp reserved_slots_available?(%Issue{state: issue_state}, %State{} = state) do
+    reservations = Config.settings!().agent.reserved_concurrent_agents_by_state
+    issue_state = normalize_issue_state(issue_state)
+
+    reserved_for_other_states =
+      Enum.reduce(reservations, 0, fn {state_name, reserved_limit}, acc ->
+        normalized_state = normalize_issue_state(state_name)
+
+        if normalized_state == issue_state do
+          acc
+        else
+          used = running_issue_count_for_state(state.running, normalized_state)
+          acc + max(reserved_limit - used, 0)
+        end
+      end)
+
+    available_slots(state) > reserved_for_other_states
+  end
+
+  defp reserved_slots_available?(_issue, _state), do: false
 
   defp running_issue_count_for_state(running, issue_state) when is_map(running) do
     normalized_state = normalize_issue_state(issue_state)
@@ -1159,6 +1185,7 @@ defmodule SymphonyElixir.Orchestrator do
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
+        issue = mark_dispatch_started(issue, &Tracker.update_issue_state/2)
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
@@ -1212,6 +1239,28 @@ defmodule SymphonyElixir.Orchestrator do
         })
     end
   end
+
+  defp mark_dispatch_started(%Issue{id: issue_id, state: state_name} = issue, updater)
+       when is_binary(issue_id) and is_binary(state_name) and is_function(updater, 2) do
+    if normalize_issue_state(state_name) == "todo" do
+      case updater.(issue_id, "In Progress") do
+        :ok ->
+          %{issue | state: "In Progress"}
+
+        {:error, reason} ->
+          Logger.warning("Unable to move issue to In Progress before agent run: #{issue_context(issue)} reason=#{inspect(reason)}")
+          issue
+
+        other ->
+          Logger.warning("Unexpected issue state update result before agent run: #{issue_context(issue)} result=#{inspect(other)}")
+          issue
+      end
+    else
+      issue
+    end
+  end
+
+  defp mark_dispatch_started(%Issue{} = issue, _updater), do: issue
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
@@ -1876,7 +1925,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
-    available_slots(state) > 0 and state_slots_available?(issue, state.running)
+    available_slots(state) > 0 and
+      reserved_slots_available?(issue, state) and
+      state_slots_available?(issue, state.running)
   end
 
   defp apply_codex_token_delta(
