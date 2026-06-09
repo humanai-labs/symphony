@@ -1515,13 +1515,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "agent runner knobs default and parse" do
-    assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(%{})
+    assert {:ok, settings} = Schema.parse(%{})
     assert settings.agent.default_runner == "codex"
     assert settings.agent.runner_failure_budget == 3
     assert settings.agent.runner_fallback_enabled == false
 
     assert {:ok, custom} =
-             SymphonyElixir.Config.Schema.parse(%{
+             Schema.parse(%{
                "agent" => %{
                  "default_runner" => "claude",
                  "runner_failure_budget" => 5,
@@ -1536,13 +1536,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "agent rejects an unknown default_runner" do
     assert {:error, {:invalid_workflow_config, message}} =
-             SymphonyElixir.Config.Schema.parse(%{"agent" => %{"default_runner" => "gpt"}})
+             Schema.parse(%{"agent" => %{"default_runner" => "gpt"}})
 
     assert message =~ "default_runner"
   end
 
   test "claude block defaults and parses" do
-    assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(%{})
+    assert {:ok, settings} = Schema.parse(%{})
     assert settings.claude.command == "claude"
     assert settings.claude.permission_mode == "acceptEdits"
     assert settings.claude.turn_timeout_ms == 1_800_000
@@ -1550,7 +1550,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert is_list(settings.claude.allowed_tools)
 
     assert {:ok, custom} =
-             SymphonyElixir.Config.Schema.parse(%{
+             Schema.parse(%{
                "claude" => %{"command" => "claude-next", "permission_mode" => "plan"}
              })
 
@@ -1560,7 +1560,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "claude rejects an unknown permission_mode" do
     assert {:error, {:invalid_workflow_config, message}} =
-             SymphonyElixir.Config.Schema.parse(%{"claude" => %{"permission_mode" => "yolo"}})
+             Schema.parse(%{"claude" => %{"permission_mode" => "yolo"}})
 
     assert message =~ "permission_mode"
   end

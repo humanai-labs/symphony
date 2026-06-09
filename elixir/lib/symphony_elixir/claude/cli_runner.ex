@@ -71,7 +71,7 @@ defmodule SymphonyElixir.Claude.CliRunner do
     end
 
     resume = Map.get(session, :resume)
-    if is_pid(resume) and Process.alive?(resume), do: Agent.stop(resume)
+    if Process.alive?(resume), do: Agent.stop(resume)
     :ok
   end
 
@@ -183,23 +183,27 @@ defmodule SymphonyElixir.Claude.CliRunner do
   defp handle_line(port, on_message, resume, timeout_ms, line) do
     case Jason.decode(line) do
       {:ok, decoded} ->
-        {event, details} = StreamParser.classify(decoded)
-
-        if event == :session_started and is_binary(details[:session_id]),
-          do: Agent.update(resume, fn _ -> details[:session_id] end)
-
-        emit(on_message, event, details)
-
-        case event do
-          :turn_completed -> {:ok, %{session_id: details[:session_id], result: :turn_completed}}
-          :turn_failed -> {:error, {:turn_failed, details}}
-          :codex_error -> {:error, {:codex_error, details}}
-          _ -> receive_loop(port, on_message, resume, timeout_ms, "")
-        end
+        handle_decoded_line(decoded, port, on_message, resume, timeout_ms)
 
       {:error, _} ->
         Logger.debug("Claude non-JSON line: #{String.slice(line, 0, 200)}")
         receive_loop(port, on_message, resume, timeout_ms, "")
+    end
+  end
+
+  defp handle_decoded_line(decoded, port, on_message, resume, timeout_ms) do
+    {event, details} = StreamParser.classify(decoded)
+
+    if event == :session_started and is_binary(details[:session_id]),
+      do: Agent.update(resume, fn _ -> details[:session_id] end)
+
+    emit(on_message, event, details)
+
+    case event do
+      :turn_completed -> {:ok, %{session_id: details[:session_id], result: :turn_completed}}
+      :turn_failed -> {:error, {:turn_failed, details}}
+      :codex_error -> {:error, {:codex_error, details}}
+      _ -> receive_loop(port, on_message, resume, timeout_ms, "")
     end
   end
 
@@ -251,7 +255,7 @@ defmodule SymphonyElixir.Claude.CliRunner do
   end
 
   defp close_port(port) do
-    if is_port(port) and :erlang.port_info(port) != :undefined do
+    if :erlang.port_info(port) != :undefined do
       try do
         Port.close(port)
       rescue

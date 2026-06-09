@@ -24,4 +24,8 @@ defmodule SymphonyElixir.RunnerSelectionTest do
   test "label matching is case and whitespace insensitive" do
     assert RunnerSelection.from_labels([" Agent:Claude "], :codex) == {:ok, :claude}
   end
+
+  test "non-binary labels are ignored and the default applies" do
+    assert RunnerSelection.from_labels([nil, :backend, 42], :claude) == {:ok, :claude}
+  end
 end

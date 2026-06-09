@@ -42,4 +42,17 @@ defmodule SymphonyElixir.Claude.StreamParserTest do
   test "explicit error type yields codex_error" do
     assert {:codex_error, %{}} = StreamParser.classify(%{"type" => "error", "error" => %{"message" => "boom"}})
   end
+
+  test "user message (tool result) is a notification" do
+    assert {:notification, %{}} = StreamParser.classify(%{"type" => "user", "message" => %{}})
+  end
+
+  test "unknown line types fall back to a notification" do
+    assert {:notification, %{}} = StreamParser.classify(%{"type" => "rate_limit_event"})
+  end
+
+  test "a result without a usage field yields nil usage" do
+    assert {:turn_completed, %{usage: nil}} =
+             StreamParser.classify(%{"type" => "result", "subtype" => "success", "session_id" => "s"})
+  end
 end

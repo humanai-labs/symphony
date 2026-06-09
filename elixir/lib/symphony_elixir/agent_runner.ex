@@ -4,8 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Runner
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Runner, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -91,53 +90,60 @@ defmodule SymphonyElixir.AgentRunner do
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
     with {:ok, session} <- runner.start_session(workspace, worker_host: worker_host) do
+      turn_ctx = %{
+        session: session,
+        workspace: workspace,
+        recipient: codex_update_recipient,
+        opts: opts,
+        issue_state_fetcher: issue_state_fetcher,
+        max_turns: max_turns,
+        runner: runner
+      }
+
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns, runner)
+        do_run_codex_turns(turn_ctx, issue, 1)
       after
         runner.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns, runner) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+  defp do_run_codex_turns(turn_ctx, issue, turn_number) do
+    prompt = build_turn_prompt(issue, turn_ctx.opts, turn_number, turn_ctx.max_turns)
 
     with {:ok, turn_session} <-
-           runner.run_turn(
-             app_session,
+           turn_ctx.runner.run_turn(
+             turn_ctx.session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(turn_ctx.recipient, issue)
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info(
+        "Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} " <>
+          "workspace=#{turn_ctx.workspace} turn=#{turn_number}/#{turn_ctx.max_turns}"
+      )
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+      continue_after_turn(turn_ctx, issue, turn_number)
+    end
+  end
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns,
-            runner
-          )
+  defp continue_after_turn(turn_ctx, issue, turn_number) do
+    case continue_with_issue?(issue, turn_ctx.issue_state_fetcher) do
+      {:continue, refreshed_issue} when turn_number < turn_ctx.max_turns ->
+        Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{turn_ctx.max_turns}")
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+        do_run_codex_turns(turn_ctx, refreshed_issue, turn_number + 1)
 
-          :ok
+      {:continue, refreshed_issue} ->
+        Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-        {:done, _refreshed_issue} ->
-          :ok
+        :ok
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+      {:done, _refreshed_issue} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

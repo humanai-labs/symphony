@@ -757,8 +757,6 @@ defmodule SymphonyElixir.Orchestrator do
     Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
   end
 
-  defp last_activity_timestamp(_running_entry), do: nil
-
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
     Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
