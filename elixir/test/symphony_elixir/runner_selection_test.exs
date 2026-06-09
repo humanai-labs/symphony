@@ -28,4 +28,29 @@ defmodule SymphonyElixir.RunnerSelectionTest do
   test "non-binary labels are ignored and the default applies" do
     assert RunnerSelection.from_labels([nil, :backend, 42], :claude) == {:ok, :claude}
   end
+
+  test "require_explicit refuses the default when no agent label is present" do
+    assert RunnerSelection.from_labels(["backend"], :codex, require_explicit: true) ==
+             {:error, :no_runner_specified}
+
+    assert RunnerSelection.from_labels([], :claude, require_explicit: true) ==
+             {:error, :no_runner_specified}
+  end
+
+  test "require_explicit still honours an explicit agent label" do
+    assert RunnerSelection.from_labels(["agent:claude"], :codex, require_explicit: true) ==
+             {:ok, :claude}
+
+    assert RunnerSelection.from_labels(["agent:codex"], :claude, require_explicit: true) ==
+             {:ok, :codex}
+  end
+
+  test "require_explicit never masks a conflict" do
+    assert RunnerSelection.from_labels(["agent:codex", "agent:claude"], :codex, require_explicit: true) ==
+             {:error, :conflicting_labels}
+  end
+
+  test "require_explicit: false is the default and routes to the default runner" do
+    assert RunnerSelection.from_labels(["backend"], :codex, require_explicit: false) == {:ok, :codex}
+  end
 end

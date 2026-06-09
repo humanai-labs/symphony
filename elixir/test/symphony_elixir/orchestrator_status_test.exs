@@ -1907,6 +1907,52 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              {:error, :conflicting_labels}
   end
 
+  test "require_explicit_runner skips an unlabeled issue without claiming or commenting" do
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      worker_ssh_hosts: ["worker-01"],
+      worker_max_concurrent_agents_per_host: 1,
+      agent_require_explicit_runner: true
+    )
+
+    unlabeled_issue = %Issue{
+      id: "issue-no-runner",
+      identifier: "MT-NO-RUNNER",
+      title: "No agent label",
+      state: "Todo",
+      url: "https://example.org/issues/MT-NO-RUNNER",
+      labels: ["backend"]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RequireRunnerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    base_state = :sys.get_state(pid)
+
+    state_after =
+      Orchestrator.do_dispatch_issue_for_test(base_state, unlabeled_issue, nil, nil)
+
+    # No runner chosen => not claimed, nothing spawned, and no Linear comment.
+    refute MapSet.member?(state_after.claimed, unlabeled_issue.id)
+    assert state_after.running == base_state.running
+    refute_received {:memory_tracker_comment, "issue-no-runner", _}
+
+    # Adding an explicit agent label makes the same issue dispatch normally.
+    labeled_issue = %{unlabeled_issue | labels: ["agent:claude"]}
+
+    assert SymphonyElixir.Orchestrator.runner_for_dispatch_for_test(labeled_issue, :codex) ==
+             {:ok, :claude}
+  end
+
   test "conflicting agent labels comment exactly once and auto-resume when fixed" do
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
 

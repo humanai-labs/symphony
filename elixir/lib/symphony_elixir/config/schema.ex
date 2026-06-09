@@ -141,6 +141,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:default_runner, :string, default: "codex")
       field(:runner_failure_budget, :integer, default: 3)
       field(:runner_fallback_enabled, :boolean, default: false)
+      field(:require_explicit_runner, :boolean, default: false)
       field(:reserved_concurrent_agents_by_state, :map, default: %{})
     end
 
@@ -157,6 +158,7 @@ defmodule SymphonyElixir.Config.Schema do
           :default_runner,
           :runner_failure_budget,
           :runner_fallback_enabled,
+          :require_explicit_runner,
           :reserved_concurrent_agents_by_state
         ],
         empty_values: []
