@@ -196,6 +196,18 @@ defmodule SymphonyElixir.Claude.CliRunnerTest do
 
       argv_line = File.read!(trace) |> String.split("\n", trim: true) |> List.first()
       assert argv_line =~ "--mcp-config"
+      # Headless hygiene: only the Symphony MCP, and skills disabled (operator hooks).
+      assert argv_line =~ "--strict-mcp-config"
+      assert argv_line =~ "--disable-slash-commands"
+
+      # Regression guard: the prompt must precede the variadic flags, otherwise
+      # claude swallows it as an extra --allowedTools/--mcp-config value and aborts
+      # with "Invalid MCP configuration" (port exit 1).
+      {prompt_pos, _} = :binary.match(argv_line, "do mcp thing")
+      {tools_pos, _} = :binary.match(argv_line, "--allowedTools")
+      {mcp_pos, _} = :binary.match(argv_line, "--mcp-config")
+      assert prompt_pos < tools_pos
+      assert prompt_pos < mcp_pos
     after
       File.rm_rf(test_root)
     end

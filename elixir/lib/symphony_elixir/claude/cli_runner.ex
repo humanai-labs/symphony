@@ -116,14 +116,24 @@ defmodule SymphonyElixir.Claude.CliRunner do
     mcp_flag = if is_binary(mcp_config_path), do: " --mcp-config #{shell_escape(mcp_config_path)}", else: ""
     tools = Enum.join(claude.allowed_tools, ",")
 
-    # `< /dev/null` is REQUIRED: claude -p otherwise waits ~3s for stdin before proceeding
-    # (the prompt is passed as argv, not stdin). See test/fixtures/claude/SHAPES.md.
-    "#{claude.command} -p --output-format stream-json --verbose" <>
+    # The prompt MUST come right after `-p`, BEFORE --allowedTools/--mcp-config:
+    # both flags are variadic and would otherwise swallow the prompt as an extra
+    # value (claude then fails with "Input must be provided" or, with an mcp config,
+    # "Invalid MCP configuration"). `< /dev/null` is still REQUIRED: claude -p
+    # otherwise waits ~3s for stdin before proceeding.
+    #
+    # --strict-mcp-config: load ONLY the Symphony MCP, never the operator's global
+    # MCP servers (e.g. playwright/pencil) — those spawn on startup and hang the turn.
+    # --disable-slash-commands: disable skills, so operator SessionStart hooks that
+    # inject "you must invoke a skill first" can't derail a headless run.
+    # See test/fixtures/claude/SHAPES.md.
+    "#{claude.command} -p #{shell_escape(prompt)} --output-format stream-json --verbose" <>
       " --permission-mode #{shell_escape(claude.permission_mode)}" <>
       " --allowedTools #{shell_escape(tools)}" <>
+      " --strict-mcp-config --disable-slash-commands" <>
       resume_flag <>
       mcp_flag <>
-      " " <> shell_escape(prompt) <> " < /dev/null"
+      " < /dev/null"
   end
 
   # Written ONCE per session in start_session and reused across turns. Returns nil when
