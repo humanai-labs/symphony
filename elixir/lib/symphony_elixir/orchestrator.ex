@@ -37,6 +37,7 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       conflicting: MapSet.new(),
+      redispatch_counts: %{},
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
@@ -302,7 +303,9 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, reconcile_conflicting_ids(state, issues))
+      state = reconcile_conflicting_ids(state, issues)
+      state = reconcile_redispatch_counts(state, issues)
+      choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -875,6 +878,111 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  # ── ② Redispatch budget（Merging 进度预算兜底）────────────────────────────
+  # 防止 issue 在某 active state（如 Merging）被无限重新派发空转烧 token：
+  # 每次派发计数，超过 per-state 预算 max_redispatch_attempts_by_state 即移到 Blocked。
+  # runner 每个 turn 都「成功」退出时 failure_budget 拦不到，靠这个兜底（FAK-78 教训）。
+
+  @doc false
+  def reconcile_redispatch_counts_for_test(%State{} = state, issues),
+    do: reconcile_redispatch_counts(state, issues)
+
+  @doc false
+  def redispatch_budget_exhausted_for_test?(count, budget), do: budget_exhausted?(count, budget)
+
+  # 每个 poll 清掉「已离开受预算管控 state」的计数（合并到 Done / 被移走 / 不可见）。
+  defp reconcile_redispatch_counts(%State{} = state, issues) when is_list(issues) do
+    kept =
+      issues
+      |> Enum.flat_map(fn
+        %Issue{id: id, state: issue_state} when is_binary(id) ->
+          if Config.max_redispatch_attempts_for_state(issue_state) > 0 and
+               Map.has_key?(state.redispatch_counts, id) do
+            [{id, Map.fetch!(state.redispatch_counts, id)}]
+          else
+            []
+          end
+
+        _ ->
+          []
+      end)
+      |> Map.new()
+
+    %{state | redispatch_counts: kept}
+  end
+
+  defp reconcile_redispatch_counts(%State{} = state, _issues), do: state
+
+  defp redispatch_budget_exhausted?(
+         %Issue{id: id, state: issue_state},
+         %State{redispatch_counts: counts}
+       )
+       when is_binary(id) do
+    budget_exhausted?(
+      Map.get(counts, id, 0),
+      Config.max_redispatch_attempts_for_state(issue_state)
+    )
+  end
+
+  defp redispatch_budget_exhausted?(_issue, _state), do: false
+
+  defp budget_exhausted?(count, budget) when is_integer(count) and is_integer(budget) do
+    budget > 0 and count >= budget
+  end
+
+  defp budget_exhausted?(_count, _budget), do: false
+
+  defp bump_redispatch_count(%State{} = state, %Issue{id: id, state: issue_state})
+       when is_binary(id) do
+    if Config.max_redispatch_attempts_for_state(issue_state) > 0 do
+      %{state | redispatch_counts: Map.update(state.redispatch_counts, id, 1, &(&1 + 1))}
+    else
+      state
+    end
+  end
+
+  defp bump_redispatch_count(%State{} = state, _issue), do: state
+
+  defp block_redispatch_overrun(%State{} = state, %Issue{} = issue) do
+    budget = Config.max_redispatch_attempts_for_state(issue.state)
+
+    Logger.warning("Redispatch budget exhausted for #{issue_context(issue)} state=#{issue.state} after #{budget} dispatches; blocking to stop redispatch churn")
+
+    Tracker.create_comment(
+      issue.id,
+      "在 #{issue.state} 阶段被自动重新派发 #{budget} 次仍未推进到下一状态，已停止重新派发以防空转烧 token（FAK-78 教训）。需人工介入后在 Linear 重新触发。"
+    )
+
+    block_issue_from_issue(state, issue, "redispatch budget exhausted in #{issue.state}")
+  end
+
+  # block_issue_from_entry 的姐妹版：超限发生在 issue 尚未进入 running 时，从 Issue 直接构造 blocked entry。
+  defp block_issue_from_issue(%State{} = state, %Issue{} = issue, error) do
+    blocked_entry = %{
+      issue_id: issue.id,
+      identifier: issue.identifier || issue.id,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      runner: :codex,
+      error: error,
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | running: Map.delete(state.running, issue.id),
+        retry_attempts: Map.delete(state.retry_attempts, issue.id),
+        redispatch_counts: Map.delete(state.redispatch_counts, issue.id),
+        claimed: MapSet.put(state.claimed, issue.id),
+        blocked: Map.put(state.blocked, issue.id, blocked_entry)
+    }
+  end
+
   @doc false
   @spec reconcile_conflicting_ids_for_test(term(), [Issue.t()]) :: term()
   def reconcile_conflicting_ids_for_test(%State{} = state, issues) when is_list(issues) do
@@ -900,10 +1008,17 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
+      cond do
+        redispatch_budget_exhausted?(issue, state_acc) ->
+          block_redispatch_overrun(state_acc, issue)
+
+        should_dispatch_issue?(issue, state_acc, active_states, terminal_states) ->
+          state_acc
+          |> dispatch_issue(issue)
+          |> bump_redispatch_count(issue)
+
+        true ->
+          state_acc
       end
     end)
   end

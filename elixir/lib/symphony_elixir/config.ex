@@ -61,6 +61,17 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec max_redispatch_attempts_for_state(term()) :: non_neg_integer()
+  def max_redispatch_attempts_for_state(state_name) when is_binary(state_name) do
+    Map.get(
+      settings!().agent.max_redispatch_attempts_by_state,
+      Schema.normalize_issue_state(state_name),
+      0
+    )
+  end
+
+  def max_redispatch_attempts_for_state(_state_name), do: 0
+
   @spec stall_timeout_ms_for_runner(:codex | :claude) :: non_neg_integer()
   def stall_timeout_ms_for_runner(:claude), do: settings!().claude.stall_timeout_ms
   def stall_timeout_ms_for_runner(_runner), do: settings!().codex.stall_timeout_ms
