@@ -143,6 +143,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:runner_fallback_enabled, :boolean, default: false)
       field(:require_explicit_runner, :boolean, default: false)
       field(:reserved_concurrent_agents_by_state, :map, default: %{})
+      field(:max_redispatch_attempts_by_state, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -159,7 +160,8 @@ defmodule SymphonyElixir.Config.Schema do
           :runner_failure_budget,
           :runner_fallback_enabled,
           :require_explicit_runner,
-          :reserved_concurrent_agents_by_state
+          :reserved_concurrent_agents_by_state,
+          :max_redispatch_attempts_by_state
         ],
         empty_values: []
       )
@@ -168,10 +170,12 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> update_change(:reserved_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
+      |> update_change(:max_redispatch_attempts_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
       |> validate_inclusion(:default_runner, ["codex", "claude"])
       |> validate_number(:runner_failure_budget, greater_than: 0)
       |> Schema.validate_state_limits(:reserved_concurrent_agents_by_state)
+      |> Schema.validate_state_limits(:max_redispatch_attempts_by_state)
       |> Schema.validate_reserved_agent_limits()
     end
   end
